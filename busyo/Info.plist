@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>NSAppTransportSecurity</key>
+    <dict>
+      <key>NSAllowsArbitraryLoads</key><true/>
+    </dict>
+<!--    <key>NSAppTransportSecurity</key>-->
+<!--    <dict>-->
+<!--      <key>NSExceptionDomains</key>-->
+<!--      <dict>-->
+<!--        <key>apis.data.go.kr</key>-->
+<!--        <dict>-->
+<!--          <key>NSIncludesSubdomains</key><true/>-->
+<!--          <key>NSExceptionAllowsInsecureHTTPLoads</key><false/>-->
+<!--          <key>NSExceptionMinimumTLSVersion</key><string>TLSv1.0</string>-->
+<!--          <key>NSRequiresForwardSecrecy</key><false/>-->
+<!--          <key>NSRequiresCertificateTransparency</key><false/>-->
+<!--        </dict>-->
+<!--      </dict>-->
+<!--    </dict>-->
+
+
+
+  <!-- 위치 권한: '사용 중에만' 권한 요청 문구 (필수) -->
+  <key>NSLocationWhenInUseUsageDescription</key>
+  <string>내 주변 정류장과 버스 위치를 보여주기 위해 위치 접근이 필요합니다.</string>
+
+  <!-- 항상/사용중 모두 요청할 게 아니라면 없어도 되지만, 추후 필요하면 활성화 -->
+  <key>NSLocationAlwaysAndWhenInUseUsageDescription</key>
+  <string>앱 사용 중에도 주변 정류장을 빠르게 찾기 위해 위치 접근을 허용해 주세요.</string>
+
+</dict>
+</plist>
