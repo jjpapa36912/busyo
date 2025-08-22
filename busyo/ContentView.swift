@@ -1,8 +1,10 @@
 //
-//  Busyo_SingleFile_KVOFix.swift
-//  CITY_CODE=25 고정 / 제스처 종료 후 1회 호출 / Arrivals→BusLoc / 버스 주기 갱신
-//  ✅ KVO 크래시 방지: 수동 willChange/didChange 제거 + CATransaction 애니메이션
-//  ✅ 버스 갱신 직렬화(겹침 방지)
+//  Busyo_SingleFile_FollowFix_StableList.swift
+//  CITY_CODE=25 / 제스처 종료 후 1회 호출 / Arrivals→BusLoc / 클러스터링
+//  + 버스=파랑, 정류장=빨강 / API 카운터 / 내 위치 버튼
+//  + [FIX] 선택해도 다른 버스 안 사라짐(가시성 제거 → 데이터 기준 제거)
+//  + [FIX] 선택 상태에서도 좌표 갱신/애니메이션 반영(KVO)
+//  + [ADD] 말풍선에 “다음 정류장 · ETA분”
 //
 
 import SwiftUI
@@ -11,19 +13,18 @@ import CoreLocation
 import Foundation
 
 // MARK: - App
-
 @main
 struct BusyoApp: App {
     var body: some Scene { WindowGroup { BusMapScreen() } }
 }
 
 // MARK: - Const & Utils
-
 private let CITY_CODE = 25
-private let MIN_RELOAD_DIST: CLLocationDistance = 250   // m
-private let MIN_ZOOM_RATIO: CGFloat = 0.10              // 10%
-private let REGION_COOLDOWN_SEC: Double = 6.0           // 제스처 종료 후 재호출 쿨다운
-private let BUS_REFRESH_SEC: UInt64 = 10                // 버스 주기 갱신(초)
+private let MIN_RELOAD_DIST: CLLocationDistance = 250
+private let MIN_ZOOM_RATIO: CGFloat = 0.10
+private let REGION_COOLDOWN_SEC: Double = 6.0
+private let BUS_REFRESH_SEC: UInt64 = 5
+private let SHOW_DEBUG = false
 
 fileprivate extension String {
     var encodedForServiceKey: String { addingPercentEncoding(withAllowedCharacters: .alphanumerics) ?? self }
@@ -31,48 +32,33 @@ fileprivate extension String {
 fileprivate func maskKey(_ k: String) -> String { k.count > 12 ? "\(k.prefix(6))...\(k.suffix(6))" : "****" }
 
 // MARK: - Models
-
-struct BusStop: Identifiable, Hashable {
-    let id: String
-    let name: String
-    let lat: Double
-    let lon: Double
-    let cityCode: Int
-}
-
+struct BusStop: Identifiable, Hashable { let id: String, name: String, lat: Double, lon: Double, cityCode: Int }
 struct BusLive: Identifiable, Hashable {
-    let id: String        // vehicleno
+    let id: String
     let routeNo: String
     var lat: Double
     var lon: Double
     var etaMinutes: Int?
+    var nextStopName: String?
 }
-
-struct ArrivalInfo: Identifiable, Hashable {
-    let id = UUID()
-    let routeId: String
-    let routeNo: String
-    let etaMinutes: Int
-}
-
+struct ArrivalInfo: Identifiable, Hashable { let id = UUID(); let routeId: String; let routeNo: String; let etaMinutes: Int }
 enum APIError: Error { case invalidURL, http(Int), decode(Error) }
 
-// MARK: - Flexible Decoders
-
+// MARK: - Flex decoders
 struct FlexString: Decodable {
     let value: String
-    init(from decoder: Decoder) throws {
-        let c = try decoder.singleValueContainer()
+    init(from d: Decoder) throws {
+        let c = try d.singleValueContainer()
         if let s = try? c.decode(String.self) { value = s }
         else if let i = try? c.decode(Int.self) { value = String(i) }
-        else if let d = try? c.decode(Double.self) { value = String(d) }
-        else { throw DecodingError.typeMismatch(String.self, .init(codingPath: decoder.codingPath, debugDescription: "Not a string/int/double")) }
+        else if let x = try? c.decode(Double.self) { value = String(x) }
+        else { throw DecodingError.typeMismatch(String.self, .init(codingPath: d.codingPath, debugDescription: "not string/int/double")) }
     }
 }
 struct FlexInt: Decodable {
     let value: Int?
-    init(from decoder: Decoder) throws {
-        let c = try decoder.singleValueContainer()
+    init(from d: Decoder) throws {
+        let c = try d.singleValueContainer()
         if let i = try? c.decode(Int.self) { value = i }
         else if let s = try? c.decode(String.self) { value = Int(s) }
         else { value = nil }
@@ -80,16 +66,27 @@ struct FlexInt: Decodable {
 }
 struct FlexDouble: Decodable {
     let value: Double
-    init(from decoder: Decoder) throws {
-        let c = try decoder.singleValueContainer()
-        if let d = try? c.decode(Double.self) { value = d }
-        else if let s = try? c.decode(String.self), let d = Double(s.replacingOccurrences(of: ",", with: "")) { value = d }
-        else { throw DecodingError.typeMismatch(Double.self, .init(codingPath: decoder.codingPath, debugDescription: "Not a double/string")) }
+    init(from d: Decoder) throws {
+        let c = try d.singleValueContainer()
+        if let v = try? c.decode(Double.self) { value = v }
+        else if let s = try? c.decode(String.self), let v = Double(s.replacingOccurrences(of: ",", with: "")) { value = v }
+        else { throw DecodingError.typeMismatch(Double.self, .init(codingPath: d.codingPath, debugDescription: "not double/string")) }
+    }
+}
+
+// MARK: - API Counter (thread-safe)
+actor APICounter {
+    static let shared = APICounter()
+    private var total: Int = 0
+    private var per: [String: Int] = [:]
+    func bump(_ tag: String) {
+        total += 1; per[tag, default: 0] += 1
+        let parts = per.map { "\($0.key)=\($0.value)" }.sorted().joined(separator: "  ")
+        print("🧮🟨 [API COUNT] total=\(total)  \(parts)")
     }
 }
 
 // MARK: - API
-
 final class BusAPI: NSObject, URLSessionDelegate {
     private let serviceKeyRaw = "FVUZJTrP1WLAsFAKcXy8lh2Qy1DWNw5Ul2+vSY01E3cUJlO/9P+CodODXPIyzppQCPswXvc1WeblEAh6X41ClA=="
 
@@ -99,7 +96,6 @@ final class BusAPI: NSObject, URLSessionDelegate {
         c.waitsForConnectivity = true
         return URLSession(configuration: c, delegate: self, delegateQueue: nil)
     }()
-
     func urlSession(_ session: URLSession, didReceive challenge: URLAuthenticationChallenge,
                     completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void) {
         completionHandler(.performDefaultHandling, nil)
@@ -118,6 +114,7 @@ final class BusAPI: NSObject, URLSessionDelegate {
         let safe = url.absoluteString.replacingOccurrences(of: serviceKeyRaw.encodedForServiceKey,
                                                            with: maskKey(serviceKeyRaw.encodedForServiceKey))
         print("➡️ [REQ \(name)] \(safe)")
+        await APICounter.shared.bump(name)
         let (data, resp) = try await session.data(from: url)
         guard let http = resp as? HTTPURLResponse else { throw APIError.http(-1) }
         print("⬅️ [RES \(name)] \(http.statusCode) \(data.count)b")
@@ -132,11 +129,11 @@ final class BusAPI: NSObject, URLSessionDelegate {
 
     private final class XMLItemsParser: NSObject, XMLParserDelegate {
         var items: [[String:String]] = []; private var cur: [String:String]?; private var key: String?; private var buf = ""
-        func parser(_ parser: XMLParser, didStartElement name: String, namespaceURI: String?, qualifiedName qName: String?, attributes: [String : String] = [:]) {
+        func parser(_ p: XMLParser, didStartElement name: String, namespaceURI: String?, qualifiedName qName: String?, attributes: [String : String] = [:]) {
             let k = name.lowercased(); if k == "item" { cur = [:] } else if cur != nil { key = k; buf = "" }
         }
-        func parser(_ parser: XMLParser, foundCharacters string: String) { buf += string }
-        func parser(_ parser: XMLParser, didEndElement name: String, namespaceURI: String?, qualifiedName qName: String?) {
+        func parser(_ p: XMLParser, foundCharacters s: String) { buf += s }
+        func parser(_ p: XMLParser, didEndElement name: String, namespaceURI: String?, qualifiedName qName: String?) {
             let k = name.lowercased()
             if k == "item" { if let c = cur { items.append(c) }; cur = nil }
             else if let kk = key, cur != nil {
@@ -147,10 +144,12 @@ final class BusAPI: NSObject, URLSessionDelegate {
         }
     }
     private func parseXMLItems(_ data: Data) throws -> [[String:String]] {
-        let p = XMLItemsParser(); let xp = XMLParser(data: data); xp.delegate = p
+        let p = XMLItemsParser()
+        let xp = XMLParser(data: data); xp.delegate = p
         guard xp.parse() else { throw APIError.decode(xp.parserError ?? NSError(domain: "XML", code: -1)) }
         return p.items
     }
+
     private func toDouble(_ s: String?) -> Double? { s.flatMap { Double($0.replacingOccurrences(of: ",", with: "")) } }
     private func toInt(_ s: String?) -> Int? { s.flatMap { Int($0.replacingOccurrences(of: ",", with: "")) } }
 
@@ -165,24 +164,28 @@ final class BusAPI: NSObject, URLSessionDelegate {
                 .init(name: "type", value: "json"),
                 .init(name: "gpsLati", value: "\(lat)"),
                 .init(name: "gpsLong", value: "\(lon)")
-            ]
-        )
+            ])
 
         struct Root: Decodable {
             struct Resp: Decodable { let body: Body? }
             struct Body: Decodable { let items: Items? }
             struct Items: Decodable { let item: [Item]? }
             struct Item: Decodable {
-                let nodeid: String; let nodenm: String; let citycode: Int
-                let gpsLati: Double; let gpsLong: Double
+                let nodeid: String
+                let nodenm: String
+                let citycode: Int
+                let gpsLati: FlexDouble?
+                let gpsLong: FlexDouble?
                 enum CodingKeys: String, CodingKey { case nodeid, nodenm, citycode, gpsLati, gpsLong, gpslati, gpslong }
                 init(from d: Decoder) throws {
                     let c = try d.container(keyedBy: CodingKeys.self)
                     nodeid = try c.decode(String.self, forKey: .nodeid)
                     nodenm = try c.decode(String.self, forKey: .nodenm)
                     citycode = try c.decode(Int.self, forKey: .citycode)
-                    gpsLati = try (c.decodeIfPresent(Double.self, forKey: .gpsLati) ?? c.decode(Double.self, forKey: .gpslati))
-                    gpsLong = try (c.decodeIfPresent(Double.self, forKey: .gpsLong) ?? c.decode(Double.self, forKey: .gpslong))
+                    gpsLati = (try? c.decode(FlexDouble.self, forKey: .gpsLati))
+                           ?? (try? c.decode(FlexDouble.self, forKey: .gpslati))
+                    gpsLong = (try? c.decode(FlexDouble.self, forKey: .gpsLong))
+                           ?? (try? c.decode(FlexDouble.self, forKey: .gpslong))
                 }
             }
             let response: Resp?
@@ -202,7 +205,10 @@ final class BusAPI: NSObject, URLSessionDelegate {
             let r = try JSONDecoder().decode(Root.self, from: data)
             return (r.response?.body?.items?.item ?? [])
                 .filter { $0.citycode == CITY_CODE }
-                .map { .init(id: $0.nodeid, name: $0.nodenm, lat: $0.gpsLati, lon: $0.gpsLong, cityCode: $0.citycode) }
+                .compactMap {
+                    guard let la = $0.gpsLati?.value, let lo = $0.gpsLong?.value else { return nil }
+                    return .init(id: $0.nodeid, name: $0.nodenm, lat: la, lon: lo, cityCode: $0.citycode)
+                }
         }
     }
 
@@ -217,18 +223,13 @@ final class BusAPI: NSObject, URLSessionDelegate {
                 .init(name: "type", value: "json"),
                 .init(name: "cityCode", value: String(cityCode)),
                 .init(name: "nodeId", value: nodeId)
-            ]
-        )
+            ])
 
         struct Root: Decodable {
             struct Resp: Decodable { let body: Body? }
             struct Body: Decodable { let items: Items? }
             struct Items: Decodable { let item: [Item]? }
-            struct Item: Decodable {
-                let routeid: String?
-                let routeno: FlexString?
-                let arrtime: FlexInt?
-            }
+            struct Item: Decodable { let routeid: String?; let routeno: FlexString?; let arrtime: FlexInt? }
             let response: Resp?
         }
 
@@ -244,8 +245,7 @@ final class BusAPI: NSObject, URLSessionDelegate {
             let items = r.response?.body?.items?.item ?? []
             return items.compactMap { i in
                 guard let rid = i.routeid, let sec = i.arrtime?.value else { return nil }
-                let rno = i.routeno?.value ?? "?"
-                return .init(routeId: rid, routeNo: rno, etaMinutes: max(0, sec/60))
+                return .init(routeId: rid, routeNo: i.routeno?.value ?? "?", etaMinutes: max(0, sec/60))
             }
         }
     }
@@ -261,8 +261,7 @@ final class BusAPI: NSObject, URLSessionDelegate {
                 .init(name: "type", value: "json"),
                 .init(name: "cityCode", value: String(cityCode)),
                 .init(name: "routeId", value: routeId)
-            ]
-        )
+            ])
 
         struct Root: Decodable {
             struct Resp: Decodable { let body: Body? }
@@ -272,18 +271,20 @@ final class BusAPI: NSObject, URLSessionDelegate {
                 let vehicleno: String
                 let routenm: FlexString?
                 let routeno: FlexString?
-                let gpsLati: FlexDouble
-                let gpsLong: FlexDouble
-                enum CodingKeys: String, CodingKey { case vehicleno, routenm, routeno, gpsLati, gpsLong, gpslati, gpslong }
+                let gpsLati: FlexDouble?
+                let gpsLong: FlexDouble?
+                let nodenm: FlexString?
+                enum CodingKeys: String, CodingKey { case vehicleno, routenm, routeno, gpsLati, gpsLong, gpslati, gpslong, nodenm }
                 init(from d: Decoder) throws {
                     let c = try d.container(keyedBy: CodingKeys.self)
                     vehicleno = try c.decode(String.self, forKey: .vehicleno)
                     routenm   = try? c.decode(FlexString.self, forKey: .routenm)
                     routeno   = try? c.decode(FlexString.self, forKey: .routeno)
-                    if let v = try? c.decode(FlexDouble.self, forKey: .gpsLati) { gpsLati = v }
-                    else { gpsLati = try c.decode(FlexDouble.self, forKey: .gpslati) }
-                    if let v = try? c.decode(FlexDouble.self, forKey: .gpsLong) { gpsLong = v }
-                    else { gpsLong = try c.decode(FlexDouble.self, forKey: .gpslong) }
+                    gpsLati   = (try? c.decode(FlexDouble.self, forKey: .gpsLati))
+                              ?? (try? c.decode(FlexDouble.self, forKey: .gpslati))
+                    gpsLong   = (try? c.decode(FlexDouble.self, forKey: .gpsLong))
+                              ?? (try? c.decode(FlexDouble.self, forKey: .gpslong))
+                    nodenm    = try? c.decode(FlexString.self, forKey: .nodenm)
                 }
             }
             let response: Resp?
@@ -297,23 +298,25 @@ final class BusAPI: NSObject, URLSessionDelegate {
                       let r = d["routenm"] ?? d["routeno"],
                       let la = toDouble(d["gpslati"]) ?? toDouble(d["gpsLati"]),
                       let lo = toDouble(d["gpslong"]) ?? toDouble(d["gpsLong"]) else { return nil }
-                return BusLive(id: veh, routeNo: r, lat: la, lon: lo, etaMinutes: nil)
+                return BusLive(id: veh, routeNo: r, lat: la, lon: lo, etaMinutes: nil, nextStopName: d["nodenm"])
             }
         } else {
             let r = try JSONDecoder().decode(Root.self, from: data)
-            return (r.response?.body?.items?.item ?? []).map {
-                BusLive(id: $0.vehicleno,
-                        routeNo: $0.routenm?.value ?? $0.routeno?.value ?? "?",
-                        lat: $0.gpsLati.value,
-                        lon: $0.gpsLong.value,
-                        etaMinutes: nil)
+            return (r.response?.body?.items?.item ?? []).compactMap {
+                guard let la = $0.gpsLati?.value, let lo = $0.gpsLong?.value else { return nil }
+                return BusLive(
+                    id: $0.vehicleno,
+                    routeNo: $0.routenm?.value ?? $0.routeno?.value ?? "?",
+                    lat: la, lon: lo,
+                    etaMinutes: nil,
+                    nextStopName: $0.nodenm?.value
+                )
             }
         }
     }
 }
 
-// MARK: - Annotations & Views
-
+// MARK: - Annotations
 final class BusStopAnnotation: NSObject, MKAnnotation {
     let stop: BusStop
     @objc dynamic var coordinate: CLLocationCoordinate2D
@@ -329,32 +332,39 @@ final class BusAnnotation: NSObject, MKAnnotation {
     var subtitle: String?
 
     init(bus: BusLive) {
-        self.id = bus.id
-        self.routeNo = bus.routeNo
-        self.coordinate = .init(latitude: bus.lat, longitude: bus.lon)
-        self.subtitle = bus.etaMinutes.map { "약 \($0)분" }
+        id = bus.id; routeNo = bus.routeNo
+        coordinate = .init(latitude: bus.lat, longitude: bus.lon)
+        subtitle = Self.makeSubtitle(eta: bus.etaMinutes, next: bus.nextStopName)
     }
+    private static func makeSubtitle(eta: Int?, next: String?) -> String? {
+        switch (eta, next) {
+        case let (.some(e), .some(n)): return "다음 \(n) · 약 \(e)분"
+        case let (.none, .some(n)):    return "다음 \(n)"
+        case let (.some(e), .none):    return "약 \(e)분"
+        default:                       return nil
+        }
+    }
+    // ✅ 수동 KVO 제거, CATransaction으로만 애니메이션
+        func update(to b: BusLive) {
+            subtitle = Self.makeSubtitle(eta: b.etaMinutes, next: b.nextStopName)
+            let newC = CLLocationCoordinate2D(latitude: b.lat, longitude: b.lon)
 
-    // ✅ 수동 KVO 호출 제거, CATransaction으로 좌표 애니메이션
-    func update(to b: BusLive) {
-        self.subtitle = b.etaMinutes.map { "약 \($0)분" }
-        let newC = CLLocationCoordinate2D(latitude: b.lat, longitude: b.lon)
-        CATransaction.begin()
-        CATransaction.setAnimationDuration(0.35)
-        self.coordinate = newC
-        CATransaction.commit()
-    }
+            CATransaction.begin()
+            CATransaction.setAnimationDuration(0.35)
+            self.coordinate = newC
+            CATransaction.commit()
+        }
 }
 
 final class BusMarkerView: MKMarkerAnnotationView {
     override init(annotation: MKAnnotation?, reuseIdentifier: String?) {
         super.init(annotation: annotation, reuseIdentifier: reuseIdentifier)
         glyphImage = UIImage(systemName: "bus.fill")
-        markerTintColor = .systemBlue
         titleVisibility = .visible
         subtitleVisibility = .visible
         animatesWhenAdded = true
-        displayPriority = .required
+        markerTintColor = .systemBlue
+        glyphTintColor = .white
     }
     required init?(coder: NSCoder) { fatalError() }
     override func prepareForDisplay() {
@@ -363,28 +373,50 @@ final class BusMarkerView: MKMarkerAnnotationView {
     }
 }
 
-// MARK: - VM
+// 정류장=빨강 / 버스=파랑 클러스터
+final class ClusterView: MKAnnotationView {
+    private let countLabel = UILabel()
+    override init(annotation: MKAnnotation?, reuseIdentifier: String?) {
+        super.init(annotation: annotation, reuseIdentifier: reuseIdentifier)
+        frame = CGRect(x: 0, y: 0, width: 34, height: 34)
+        layer.cornerRadius = 17
+        countLabel.font = .systemFont(ofSize: 14, weight: .semibold)
+        countLabel.textColor = .white
+        countLabel.textAlignment = .center
+        countLabel.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(countLabel)
+        NSLayoutConstraint.activate([
+            countLabel.leadingAnchor.constraint(equalTo: leadingAnchor),
+            countLabel.trailingAnchor.constraint(equalTo: trailingAnchor),
+            countLabel.topAnchor.constraint(equalTo: topAnchor),
+            countLabel.bottomAnchor.constraint(equalTo: bottomAnchor),
+        ])
+    }
+    required init?(coder: NSCoder) { fatalError() }
+    override func prepareForDisplay() {
+        super.prepareForDisplay()
+        if let cluster = annotation as? MKClusterAnnotation {
+            countLabel.text = "\(cluster.memberAnnotations.count)"
+            let isStopCluster = cluster.memberAnnotations.contains { $0 is BusStopAnnotation }
+            backgroundColor = (isStopCluster ? UIColor.systemRed : UIColor.systemBlue).withAlphaComponent(0.9)
+        }
+    }
+}
 
+// MARK: - ViewModel
 @MainActor
 final class MapVM: ObservableObject {
     @Published var stops: [BusStop] = []
     @Published var buses: [BusLive] = []
-    @Published var lastError: String?
+    @Published var followBusId: String?
 
     private let api = BusAPI()
-
-    // 제스처-호출 관리
     private var lastRegion: MKCoordinateRegion?
     private var lastReloadAt: Date = .distantPast
     private var regionTask: Task<Void, Never>?
-
-    // 주기 갱신(버스만)
     private var autoTask: Task<Void, Never>?
-    private var focusStopId: String?
     private var latestTopArrivals: [ArrivalInfo] = []
-
-    // ✅ 갱신 직렬화(겹침 방지)
-    private var isRefreshingBuses = false
+    private var isRefreshing = false
 
     deinit { autoTask?.cancel(); regionTask?.cancel() }
 
@@ -403,7 +435,7 @@ final class MapVM: ObservableObject {
     func onRegionCommitted(_ region: MKCoordinateRegion) {
         regionTask?.cancel()
         regionTask = Task { [weak self] in
-            try? await Task.sleep(nanoseconds: 500_000_000) // 0.5s 디바운스
+            try? await Task.sleep(nanoseconds: 500_000_000)
             guard let self else { return }
             guard self.shouldReload(for: region) else { return }
             self.lastRegion = region
@@ -417,27 +449,23 @@ final class MapVM: ObservableObject {
             let stops = try await api.fetchStops(lat: center.latitude, lon: center.longitude)
             self.stops = stops
             guard let focus = stops.first else { return }
-            self.focusStopId = focus.id
 
             var arrivals = try await api.fetchArrivalsDetailed(cityCode: CITY_CODE, nodeId: focus.id)
             arrivals.sort { $0.etaMinutes < $1.etaMinutes }
-            let top = Array(arrivals.prefix(3))
-            self.latestTopArrivals = top
+            latestTopArrivals = Array(arrivals.prefix(5))
 
             let busArrays: [[BusLive]] = try await withThrowingTaskGroup(of: [BusLive].self) { group in
-                for a in top { group.addTask { try await self.api.fetchBusLocations(cityCode: CITY_CODE, routeId: a.routeId) } }
+                for a in latestTopArrivals { group.addTask { try await self.api.fetchBusLocations(cityCode: CITY_CODE, routeId: a.routeId) } }
                 var acc: [[BusLive]] = []; while let arr = try await group.next() { acc.append(arr) }; return acc
             }
             var merged = busArrays.flatMap { $0 }
-            let etaByRoute = Dictionary(uniqueKeysWithValues: top.map { ($0.routeNo, $0.etaMinutes) })
+            let etaByRoute = Dictionary(uniqueKeysWithValues: latestTopArrivals.map { ($0.routeNo, $0.etaMinutes) })
             merged = merged.map { var m = $0; m.etaMinutes = etaByRoute[m.routeNo]; return m }
-
-            if !merged.isEmpty { self.buses = merged } // 빈 응답이면 유지
-            self.lastError = nil
+            self.buses = merged
 
             startAutoRefresh()
         } catch {
-            self.lastError = (error as NSError).localizedDescription
+            print("❌ reload error: \(error)")
         }
     }
 
@@ -453,29 +481,24 @@ final class MapVM: ObservableObject {
     }
 
     private func refreshBusesOnly() async {
-        if isRefreshingBuses { return }    // ✅ 겹침 방지
-        isRefreshingBuses = true
-        defer { isRefreshingBuses = false }
-
-        let top = latestTopArrivals
-        guard !top.isEmpty else { return }
+        if isRefreshing { return }
+        isRefreshing = true
+        defer { isRefreshing = false }
+        guard !latestTopArrivals.isEmpty else { return }
         do {
             let busArrays: [[BusLive]] = try await withThrowingTaskGroup(of: [BusLive].self) { group in
-                for a in top { group.addTask { try await self.api.fetchBusLocations(cityCode: CITY_CODE, routeId: a.routeId) } }
+                for a in latestTopArrivals { group.addTask { try await self.api.fetchBusLocations(cityCode: CITY_CODE, routeId: a.routeId) } }
                 var acc: [[BusLive]] = []; while let arr = try await group.next() { acc.append(arr) }; return acc
             }
             var merged = busArrays.flatMap { $0 }
-            let etaByRoute = Dictionary(uniqueKeysWithValues: top.map { ($0.routeNo, $0.etaMinutes) })
+            let etaByRoute = Dictionary(uniqueKeysWithValues: latestTopArrivals.map { ($0.routeNo, $0.etaMinutes) })
             merged = merged.map { var m = $0; m.etaMinutes = etaByRoute[m.routeNo]; return m }
-            if !merged.isEmpty { self.buses = merged }
-        } catch {
-            // 네트워크 일시 오류는 무시
-        }
+            self.buses = merged
+        } catch { }
     }
 }
 
-// MARK: - Map
-
+// MARK: - Map helpers
 private extension MKMapView {
     var isRegionChangeFromUserInteraction: Bool {
         guard let grs = subviews.first?.gestureRecognizers else { return false }
@@ -483,8 +506,10 @@ private extension MKMapView {
     }
 }
 
+// MARK: - Map View
 struct ClusteredMapView: UIViewRepresentable {
     @ObservedObject var vm: MapVM
+    @Binding var recenterRequest: Bool
 
     func makeUIView(context: Context) -> MKMapView {
         let map = MKMapView(frame: .zero)
@@ -495,48 +520,95 @@ struct ClusteredMapView: UIViewRepresentable {
         map.pointOfInterestFilter = .includingAll
         map.register(MKMarkerAnnotationView.self, forAnnotationViewWithReuseIdentifier: "stop")
         map.register(BusMarkerView.self, forAnnotationViewWithReuseIdentifier: "bus")
+        map.register(ClusterView.self, forAnnotationViewWithReuseIdentifier: MKMapViewDefaultClusterAnnotationViewReuseIdentifier)
         return map
     }
 
     func updateUIView(_ uiView: MKMapView, context: Context) {
-        // 정류장: 증분 추가
-        let existingStops = Set(uiView.annotations.compactMap { ($0 as? BusStopAnnotation)?.stop.id })
-        let toAddStops = vm.stops.filter { !existingStops.contains($0.id) }.map { BusStopAnnotation($0) }
-        if !toAddStops.isEmpty { uiView.addAnnotations(toAddStops) }
+        // 내 위치로 이동(권한 없으면 스킵)
+        if recenterRequest {
+            defer { DispatchQueue.main.async { self.recenterRequest = false } }
+            let status = CLLocationManager.authorizationStatus()
+            guard status == .authorizedWhenInUse || status == .authorizedAlways else {
+                print("📍 recenter skipped (auth=\(status))"); return
+            }
+            if let loc = uiView.userLocation.location?.coordinate, CLLocationCoordinate2DIsValid(loc) {
+                context.coordinator.centerOn(loc, mapView: uiView, animated: true)
+            } else {
+                print("📍 user location not ready – skip")
+            }
+        }
 
-        // 버스: 증분 업데이트 + 애니메이션 이동
-        let current = uiView.annotations.compactMap { $0 as? BusAnnotation }
-        var byId = Dictionary(uniqueKeysWithValues: current.map { ($0.id, $0) })
-        let targetIds = Set(vm.buses.map { $0.id })
+        // 정류장 동기화
+        let existingStopAnnos = uiView.annotations.compactMap { $0 as? BusStopAnnotation }
+        let existingStopIds = Set(existingStopAnnos.map { $0.stop.id })
+        let desiredStopIds = Set(vm.stops.map { $0.id })
+        let toAddStops = vm.stops.filter { !existingStopIds.contains($0.id) }.map { BusStopAnnotation($0) }
+        if !toAddStops.isEmpty { uiView.addAnnotations(toAddStops) }
+        let stopToRemove = existingStopAnnos.filter { !desiredStopIds.contains($0.stop.id) }
+        if !stopToRemove.isEmpty { uiView.removeAnnotations(stopToRemove) }
+
+        // 버스 동기화(데이터 기준)
+        let existingBusAnnos = uiView.annotations.compactMap { $0 as? BusAnnotation }
+        var byId = Dictionary(uniqueKeysWithValues: existingBusAnnos.map { ($0.id, $0) })
+        let desiredBusIds = Set(vm.buses.map { $0.id })
 
         for b in vm.buses {
             if let anno = byId[b.id] {
-                anno.update(to: b)                  // ✅ KVO 안전 애니메이션 갱신
+                anno.update(to: b)
                 byId.removeValue(forKey: b.id)
             } else {
                 uiView.addAnnotation(BusAnnotation(bus: b))
             }
         }
-
-        // 남은(=사라진) 애노테이션 제거는 살짝 지연해, 업데이트 중 KVO 해제 경합을 회피
         if !byId.isEmpty {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-                // 혹시 최신 타깃에 다시 포함되었으면 남겨둔다
-                let toRemove = byId.values.filter { !targetIds.contains($0.id) }
-                if !toRemove.isEmpty { uiView.removeAnnotations(toRemove) }
+            let toRemove = byId.values.filter { leftover in
+                if let sel = vm.followBusId, sel == leftover.id { return false }
+                return !desiredBusIds.contains(leftover.id)
             }
+            if !toRemove.isEmpty { uiView.removeAnnotations(toRemove) }
+        }
+
+        // 선택 버스 팔로우
+        if let followId = vm.followBusId,
+           let anno = uiView.annotations.first(where: { ($0 as? BusAnnotation)?.id == followId }) as? BusAnnotation {
+            context.coordinator.follow(anno, on: uiView)
         }
     }
 
     func makeCoordinator() -> Coord { Coord(self) }
+
     final class Coord: NSObject, MKMapViewDelegate {
         let parent: ClusteredMapView
         private let deb = Debouncer()
-        init(_ p: ClusteredMapView) { self.parent = p }
+        private var isAutoRecentering = false
+        init(_ p: ClusteredMapView) { parent = p }
+
+        func centerOn(_ center: CLLocationCoordinate2D, mapView: MKMapView, animated: Bool) {
+            isAutoRecentering = true
+            mapView.setCenter(center, animated: animated)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { self.isAutoRecentering = false }
+        }
+        func follow(_ anno: BusAnnotation, on mapView: MKMapView) {
+            guard CLLocationCoordinate2DIsValid(anno.coordinate) else { return }
+            let center = mapView.centerCoordinate
+            let a = CLLocation(latitude: center.latitude, longitude: center.longitude)
+            let b = CLLocation(latitude: anno.coordinate.latitude, longitude: anno.coordinate.longitude)
+            if a.distance(from: b) > 30 {
+                centerOn(anno.coordinate, mapView: mapView, animated: true)
+            }
+        }
 
         func mapView(_ mapView: MKMapView, regionDidChangeAnimated animated: Bool) {
-            guard mapView.isRegionChangeFromUserInteraction else { return }
-            deb.call(after: 0.5) { self.parent.vm.onRegionCommitted(mapView.region) }
+            deb.call(after: 0.5) {
+                if self.isAutoRecentering { return }
+                if mapView.isRegionChangeFromUserInteraction {
+                    self.parent.vm.onRegionCommitted(mapView.region)
+                } else if let followId = self.parent.vm.followBusId,
+                          let anno = mapView.annotations.first(where: { ($0 as? BusAnnotation)?.id == followId }) as? BusAnnotation {
+                    self.follow(anno, on: mapView)
+                }
+            }
         }
 
         func mapView(_ mapView: MKMapView, viewFor annotation: MKAnnotation) -> MKAnnotationView? {
@@ -544,7 +616,7 @@ struct ClusteredMapView: UIViewRepresentable {
                 let v = mapView.dequeueReusableAnnotationView(withIdentifier: "stop", for: s) as! MKMarkerAnnotationView
                 v.clusteringIdentifier = "stop"
                 v.glyphText = "🚏"
-                v.markerTintColor = .systemGray
+                v.markerTintColor = .systemRed
                 v.displayPriority = .defaultHigh
                 v.titleVisibility = .adaptive
                 return v
@@ -552,8 +624,28 @@ struct ClusteredMapView: UIViewRepresentable {
                 let v = mapView.dequeueReusableAnnotationView(withIdentifier: "bus", for: b) as! BusMarkerView
                 v.clusteringIdentifier = "bus"
                 return v
+            } else if annotation is MKClusterAnnotation {
+                return mapView.dequeueReusableAnnotationView(withIdentifier: MKMapViewDefaultClusterAnnotationViewReuseIdentifier, for: annotation)
             }
             return nil
+        }
+
+        // 선택 시 커지고 팔로우 시작
+        func mapView(_ mapView: MKMapView, didSelect view: MKAnnotationView) {
+            if let bus = view.annotation as? BusAnnotation {
+                UIView.animate(withDuration: 0.2) {
+                    view.transform = CGAffineTransform(scaleX: 1.35, y: 1.35)
+                }
+                parent.vm.followBusId = bus.id
+                follow(bus, on: mapView)
+            }
+        }
+        func mapView(_ mapView: MKMapView, didDeselect view: MKAnnotationView) {
+            if view is BusMarkerView {
+                UIView.animate(withDuration: 0.2) { view.transform = .identity }
+            }
+            // 선택 해제 후에도 계속 따라가고 싶지 않다면 아래 주석 해제
+            // parent.vm.followBusId = nil
         }
     }
 }
@@ -561,29 +653,55 @@ struct ClusteredMapView: UIViewRepresentable {
 final class Debouncer {
     private var work: DispatchWorkItem?
     func call(after sec: Double, _ block: @escaping () -> Void) {
-        work?.cancel()
-        let w = DispatchWorkItem(block: block)
-        work = w
+        work?.cancel(); let w = DispatchWorkItem(block: block); work = w
         DispatchQueue.main.asyncAfter(deadline: .now() + sec, execute: w)
     }
 }
 
-// MARK: - Screen
+// MARK: - Location
+final class LocationAuth: NSObject, ObservableObject, CLLocationManagerDelegate {
+    private let mgr = CLLocationManager()
+    override init() { super.init(); mgr.delegate = self }
+    func requestWhenInUse() { mgr.requestWhenInUseAuthorization() }
+}
 
+// MARK: - Screen
 struct BusMapScreen: View {
     @StateObject private var vm = MapVM()
+    @StateObject private var loc = LocationAuth()
+    @State private var recenterRequest = false
+
     var body: some View {
-        ClusteredMapView(vm: vm)
-            .ignoresSafeArea()
-            .task { await vm.reload(center: .init(latitude: 36.351, longitude: 127.385)) }
-            .overlay(alignment: .topLeading) {
-                VStack(alignment: .leading, spacing: 6) {
-                    Text("정류장 \(vm.stops.count)  버스 \(vm.buses.count)")
-                        .font(.caption).padding(6).background(.ultraThinMaterial).cornerRadius(8)
-                    if let e = vm.lastError {
-                        Text("⚠️ \(e)").font(.caption2).padding(6).background(.ultraThinMaterial).cornerRadius(8)
-                    }
-                }.padding()
+        ZStack {
+            ClusteredMapView(vm: vm, recenterRequest: $recenterRequest)
+                .ignoresSafeArea()
+                .task {
+                    loc.requestWhenInUse()
+                    await vm.reload(center: .init(latitude: 36.351, longitude: 127.385))
+                }
+
+            if SHOW_DEBUG, let e = Optional<String>(nil) {
+                VStack {
+                    Text("⚠️ \(e)").font(.caption2)
+                        .padding(6).background(.ultraThinMaterial).cornerRadius(8)
+                    Spacer()
+                }.padding().frame(maxWidth: .infinity, alignment: .topLeading)
             }
+
+            Button {
+                loc.requestWhenInUse()
+                recenterRequest = true
+            } label: {
+                Image(systemName: "location.fill")
+                    .font(.system(size: 18, weight: .bold))
+                    .padding(14)
+                    .background(.ultraThinMaterial)
+                    .clipShape(Circle())
+                    .shadow(radius: 3)
+            }
+            .padding(.bottom, 24)
+            .padding(.trailing, 16)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomTrailing)
+        }
     }
 }
