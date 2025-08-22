@@ -391,28 +391,58 @@ final class BusAnnotation: NSObject, MKAnnotation {
 }
 
 // MARK: - Marker view with custom callout (+ 항상 보이는 subtitle)
+// ⬇️ 기존 BusMarkerView 전체 교체
+// ⬇️ 기존 BusMarkerView 를 이 클래스로 교체
 final class BusMarkerView: MKMarkerAnnotationView {
-    private let etaLabel = UILabel()
+    private let bubble = UIView()
+    private let bubbleLabel = UILabel()
 
     override init(annotation: MKAnnotation?, reuseIdentifier: String?) {
         super.init(annotation: annotation, reuseIdentifier: reuseIdentifier)
-        glyphImage = UIImage(systemName: "bus.fill")
-        titleVisibility = .visible
-        subtitleVisibility = .visible        // 👈 마커 위의 소제목 항상 보이게
-        canShowCallout = true
 
+        // 시스템 타이틀/서브타이틀/콜아웃 비활성화 → 뒤의 검정 박스 제거
+        titleVisibility = .hidden
+        subtitleVisibility = .hidden
+        canShowCallout = false
+
+        glyphImage = UIImage(systemName: "bus.fill")
         glyphTintColor = .white
         centerOffset = CGPoint(x: 0, y: -10)
         collisionMode = .circle
-        displayPriority = .required          // 👈 버스 우선 노출
-        layer.zPosition = 10                 // 👈 겹치면 버스가 위
+        displayPriority = .required
+        layer.zPosition = 10
+        clipsToBounds = false
 
-        // 콜아웃(말풍선) detail — 선택 시에도 동일 정보 노출(2줄)
-        etaLabel.font = .systemFont(ofSize: 13)
-        etaLabel.numberOfLines = 2
-        etaLabel.textColor = .secondaryLabel
-        self.detailCalloutAccessoryView = etaLabel
+        // 커스텀 말풍선
+        bubble.translatesAutoresizingMaskIntoConstraints = false
+        bubble.backgroundColor = UIColor.systemBackground.withAlphaComponent(0.9)
+        bubble.layer.cornerRadius = 6
+        bubble.layer.masksToBounds = true
+
+        bubbleLabel.translatesAutoresizingMaskIntoConstraints = false
+        bubbleLabel.font = .systemFont(ofSize: 11)      // 더 작은 폰트
+        bubbleLabel.textColor = .label
+        bubbleLabel.numberOfLines = 1                    // 한 줄로 가로로 길게
+        bubbleLabel.adjustsFontSizeToFitWidth = true     // 폭에 맞춰 축소
+        bubbleLabel.minimumScaleFactor = 0.7             // 최소 70%까지 축소
+        bubbleLabel.lineBreakMode = .byTruncatingTail
+
+        addSubview(bubble)
+        bubble.addSubview(bubbleLabel)
+
+        NSLayoutConstraint.activate([
+            // 말풍선을 마커 위에 붙이고, 가로 최대폭을 크게(340pt) 설정
+            bubble.centerXAnchor.constraint(equalTo: centerXAnchor),
+            bubble.bottomAnchor.constraint(equalTo: topAnchor, constant: -2),
+            bubble.widthAnchor.constraint(lessThanOrEqualToConstant: 340),
+
+            bubbleLabel.leadingAnchor.constraint(equalTo: bubble.leadingAnchor, constant: 8),
+            bubbleLabel.trailingAnchor.constraint(equalTo: bubble.trailingAnchor, constant: -8),
+            bubbleLabel.topAnchor.constraint(equalTo: bubble.topAnchor, constant: 4),
+            bubbleLabel.bottomAnchor.constraint(equalTo: bubble.bottomAnchor, constant: -4),
+        ])
     }
+
     required init?(coder: NSCoder) { fatalError() }
 
     func configureTint(isFollowed: Bool) {
@@ -422,24 +452,30 @@ final class BusMarkerView: MKMarkerAnnotationView {
     override func prepareForDisplay() {
         super.prepareForDisplay()
         if let b = annotation as? BusAnnotation { glyphText = b.routeNo }
-        refreshDetail()
+        updateAlwaysOnBubble()
     }
 
-    func refreshDetail() {
+    /// 마커 위 상시 말풍선 텍스트 갱신 (다음 정류장 · ETA분)
+    func updateAlwaysOnBubble() {
         guard let a = annotation as? BusAnnotation else { return }
-        // 콜아웃 라벨
-        if let next = a.nextStopName, let eta = a.etaMinutes {
-            etaLabel.text = "다음 \(next)\n약 \(eta)분"
-        } else if let next = a.nextStopName {
-            etaLabel.text = "다음 \(next)"
-        } else if let eta = a.etaMinutes {
-            etaLabel.text = "약 \(eta)분"
-        } else {
-            etaLabel.text = nil
-        }
-        if isSelected { setNeedsLayout() }
+        let text: String? = {
+            if let next = a.nextStopName, let eta = a.etaMinutes {
+                return "다음 \(next) · \(eta)분"
+            } else if let next = a.nextStopName {
+                return "다음 \(next)"
+            } else if let eta = a.etaMinutes {
+                return "약 \(eta)분"
+            } else {
+                return nil
+            }
+        }()
+        bubbleLabel.text = text
+        bubble.isHidden = (text == nil)
+        setNeedsLayout()
+        layoutIfNeeded()
     }
 }
+
 
 // 정류장=빨강 / 버스=파랑 클러스터
 final class ClusterView: MKAnnotationView {
@@ -591,59 +627,92 @@ final class MapVM: ObservableObject {
     }
 
     // 진행방향 앞쪽 정류장 + ETA
-    private func nextStopAndETA(for coord: CLLocationCoordinate2D, track: BusTrack, fallbackByName: String?) -> (BusStop?, Int?) {
+    // ⬇️ MapVM 안의 nextStopAndETA(...) 메서드 교체
+    private func nextStopAndETA(for coord: CLLocationCoordinate2D,
+                                track: BusTrack,
+                                fallbackByName: String?) -> (BusStop?, Int?) {
+
+        // 1) 반경 300m 내 후보 수집
         let here = coord
         let nearby = stops
             .map { stop -> (BusStop, Double, Double, Double) in
                 let v = GeoUtil.deltaMeters(from: here, to: .init(latitude: stop.lat, longitude: stop.lon))
-                return (stop, v.dx, v.dy, v.dist)
+                return (stop, v.dx, v.dy, v.dist) // (stop, dx, dy, dist)
             }
             .filter { $0.3 < 300 }
 
+        // 2) 진행방향 단위벡터
         let dir = track.dirUnit
-        let ranked: [(BusStop, Double, Double, Double)]
+
+        // 3) 방향 기반 점수화
+        typealias Cand = (s: BusStop, proj: Double, lateral: Double, dist: Double)
+        let ranked: [Cand]
         if let d = dir {
             ranked = nearby
-                .map { (s, dx, dy, dist) -> (BusStop, Double, Double, Double) in
-                    let proj = dx*d.x + dy*d.y
+                .map { (s, dx, dy, dist) -> Cand in
+                    let proj = dx*d.x + dy*d.y        // 진행방향 투영거리(+ = 앞)
                     let lateral = abs(-dy*d.x + dx*d.y)
                     return (s, proj, lateral, dist)
                 }
                 .sorted {
-                    if ($0.1 >= 0) != ($1.1 >= 0) { return $0.1 >= 0 }
-                    if abs($0.2 - $1.2) > 3 { return $0.2 < $1.2 }
-                    return $0.3 < $1.3
+                    // 앞쪽 우선 → 측면 작을수록 → 실제 거리
+                    if ($0.proj >= 0) != ($1.proj >= 0) { return $0.proj >= 0 }
+                    if abs($0.lateral - $1.lateral) > 3 { return $0.lateral < $1.lateral }
+                    return $0.dist < $1.dist
                 }
         } else {
-            ranked = nearby.sorted { $0.3 < $1.3 }
+            ranked = nearby
+                .map { (s, dx, dy, dist) in (s, 0.0, 0.0, dist) }
+                .sorted { $0.dist < $1.dist }
         }
 
+        // 4) "뒤쪽" 후보 제거(약간의 오차는 허용)
+        let aheadCandidates: [Cand]
+        if dir != nil {
+            aheadCandidates = ranked.filter { $0.proj >= -8 }    // 👈 -8m까지는 허용(스냅 직후 오차)
+        } else {
+            aheadCandidates = ranked
+        }
+
+        // 5) 선택
         var chosen: BusStop?
         var forwardMeters: Double?
-        if let first = ranked.first, dir != nil, first.1 >= -15 {
-            chosen = first.0
-            forwardMeters = max(0, first.1)
-        }
-        if chosen == nil, let name = fallbackByName {
-            chosen = stops.first { name.contains($0.name) || $0.name.contains(name) }
-            if let c = chosen {
-                let v = GeoUtil.deltaMeters(from: here, to: .init(latitude: c.lat, longitude: c.lon))
-                forwardMeters = v.dist
+
+        if let best = aheadCandidates.first {
+            chosen = best.s
+            forwardMeters = max(0, best.proj > 0 ? best.proj : best.dist)
+        } else if let name = fallbackByName {
+            // fallback 이름이 "뒤쪽"이면 무시
+            if let found = stops.first(where: { name.contains($0.name) || $0.name.contains(name) }) {
+                let v = GeoUtil.deltaMeters(from: here, to: .init(latitude: found.lat, longitude: found.lon))
+                if let d = dir {
+                    let proj = v.dx*d.x + v.dy*d.y
+                    if proj >= -8 {        // 👈 뒤쪽이면 버림
+                        chosen = found
+                        forwardMeters = max(0, proj > 0 ? proj : v.dist)
+                    }
+                } else {
+                    chosen = found
+                    forwardMeters = v.dist
+                }
             }
+        } else if let near = ranked.first {
+            chosen = near.s
+            forwardMeters = near.dist
         }
-        if chosen == nil, let near = nearby.min(by: { $0.3 < $1.3 }) {
-            chosen = near.0
-            forwardMeters = near.3
-        }
+
         guard let stop = chosen else { return (nil, nil) }
 
+        // 6) ETA 계산(느리면 0~1분 보정)
         let v = max(0.1, track.speedMps)
         let dist = max(0, forwardMeters ?? 0)
         var etaSec = Int(dist / v)
         if v < 1.2 && dist < 25 { etaSec = 0 }
         let etaMin = max(0, Int((Double(etaSec) / 60.0).rounded(.toNearestOrEven)))
+
         return (stop, etaMin)
     }
+
 
     func onRegionCommitted(_ region: MKCoordinateRegion) {
         regionTask?.cancel()
@@ -910,7 +979,7 @@ struct ClusteredMapView: UIViewRepresentable {
                     context.coordinator.follow(anno, on: uiView)
                     if let v = uiView.view(for: anno) as? BusMarkerView {
                         v.configureTint(isFollowed: true)
-                        v.refreshDetail()
+                        v.updateAlwaysOnBubble()
                     }
                 }
             }
@@ -979,7 +1048,7 @@ struct ClusteredMapView: UIViewRepresentable {
                     for (anno, live) in busUpdates {
                         anno.update(to: live)
                         if let mv = mapView.view(for: anno) as? BusMarkerView {
-                            mv.refreshDetail()
+                            mv.updateAlwaysOnBubble()
                         }
                     }
                     CATransaction.commit()
@@ -1035,7 +1104,7 @@ struct ClusteredMapView: UIViewRepresentable {
                 btn.titleLabel?.font = .systemFont(ofSize: 14, weight: .semibold)
                 v.rightCalloutAccessoryView = btn
                 // 초기 라벨 세팅
-                v.refreshDetail()
+                v.updateAlwaysOnBubble()  // ⬅️ 말풍선 즉시 갱신
                 return v
             } else if annotation is MKClusterAnnotation {
                 return mapView.dequeueReusableAnnotationView(withIdentifier: MKMapViewDefaultClusterAnnotationViewReuseIdentifier, for: annotation)
@@ -1061,7 +1130,7 @@ struct ClusteredMapView: UIViewRepresentable {
             follow(bus, on: mapView)
             if let mv = view as? BusMarkerView {
                 mv.configureTint(isFollowed: true)
-                mv.refreshDetail()
+                mv.updateAlwaysOnBubble()
                 if let btn = mv.rightCalloutAccessoryView as? UIButton { btn.setTitle("해제", for: .normal) }
             }
         }
@@ -1084,7 +1153,7 @@ struct ClusteredMapView: UIViewRepresentable {
             } else {
                 parent.vm.followBusId = bus.id
                 follow(bus, on: mapView)
-                if let mv = view as? BusMarkerView { mv.configureTint(isFollowed: true); mv.refreshDetail() }
+                if let mv = view as? BusMarkerView { mv.configureTint(isFollowed: true); mv.updateAlwaysOnBubble() }
                 if let mv = view as? BusMarkerView, let btn = mv.rightCalloutAccessoryView as? UIButton { btn.setTitle("해제", for: .normal) }
             }
         }
