@@ -237,13 +237,20 @@ final class BusAPI: NSObject, URLSessionDelegate {
                 .init(name: "nodeId", value: nodeId)
             ])
 
+        // ⬇️ Root/Items 정의를 아래처럼 교체
+        // ⬇️ Root 정의만 교체
         struct Root: Decodable {
             struct Resp: Decodable { let body: Body? }
-            struct Body: Decodable { let items: Items? }
-            struct Items: Decodable { let item: [Item]? }
-            struct Item: Decodable { let routeid: String?; let routeno: FlexString?; let arrtime: FlexInt? }
+            struct Body: Decodable { let items: ItemsFlex<Item>? }   // ← 핵심
+            struct Item: Decodable {
+                let routeid: String?
+                let routeno: FlexString?
+                let arrtime: FlexInt?
+            }
             let response: Resp?
         }
+
+
 
         let (data, _) = try await send("Arrivals", url: url)
         if isLikelyXML(data) {
@@ -253,12 +260,16 @@ final class BusAPI: NSObject, URLSessionDelegate {
                 return .init(routeId: rid, routeNo: rno, etaMinutes: max(0, sec/60))
             }
         } else {
+            // ⬇️ JSON 브랜치의 매핑만 이처럼 교체
+            // JSON 분기만 아래처럼
             let r = try JSONDecoder().decode(Root.self, from: data)
-            let items = r.response?.body?.items?.item ?? []
+            let items = r.response?.body?.items?.values ?? []     // ← 안전
             return items.compactMap { i in
                 guard let rid = i.routeid, let sec = i.arrtime?.value else { return nil }
                 return .init(routeId: rid, routeNo: i.routeno?.value ?? "?", etaMinutes: max(0, sec/60))
             }
+
+
         }
     }
 
@@ -572,6 +583,9 @@ final class MapVM: ObservableObject {
     @Published var stops: [BusStop] = []
     @Published var buses: [BusLive] = []
     @Published var followBusId: String?
+    // MapVM 안
+    private var reloadTask: Task<Void, Never>?
+
 
     // 유령 파라미터
     private let STALE_GRACE_SEC: TimeInterval = 45
@@ -586,6 +600,13 @@ final class MapVM: ObservableObject {
     private var autoTask: Task<Void, Never>?
     private var latestTopArrivals: [ArrivalInfo] = []
     private var isRefreshing = false
+    
+    // MapVM 안
+    private var lastStopRefreshCenter: CLLocationCoordinate2D?
+    private let stopQueryRadiusMeters: CLLocationDistance = 500          // 보여줄 반경 정보(개념적)
+    private let centerShiftTriggerMeters: CLLocationDistance = 200       // 재조회 트리거 임계치(사용자 드래그)
+    private let centerShiftTriggerWhenFollow: CLLocationDistance = 120   // 재조회 트리거 임계치(팔로우 중)
+
 
     // smoothing / snapping
     private var tracks: [String: BusTrack] = [:]
@@ -597,17 +618,40 @@ final class MapVM: ObservableObject {
 
     deinit { autoTask?.cancel(); regionTask?.cancel() }
 
-    private func shouldReload(for region: MKCoordinateRegion) -> Bool {
-        if let prev = lastRegion {
-            let a = CLLocation(latitude: prev.center.latitude, longitude: prev.center.longitude)
-            let b = CLLocation(latitude: region.center.latitude, longitude: region.center.longitude)
-            let dist = a.distance(from: b)
-            let zoomDelta = abs(region.span.latitudeDelta - prev.span.latitudeDelta) / max(prev.span.latitudeDelta, 0.0001)
-            if dist < MIN_RELOAD_DIST && zoomDelta < MIN_ZOOM_RATIO { return false }
-        }
-        if Date().timeIntervalSince(lastReloadAt) < REGION_COOLDOWN_SEC { return false }
-        return true
+    // MapVM 안
+    private func metersBetween(_ a: CLLocationCoordinate2D?, _ b: CLLocationCoordinate2D?) -> CLLocationDistance {
+        guard let a, let b else { return .greatestFiniteMagnitude }
+        let la = CLLocation(latitude: a.latitude, longitude: a.longitude)
+        let lb = CLLocation(latitude: b.latitude, longitude: b.longitude)
+        return la.distance(from: lb)
     }
+
+    
+    // ⬇️ 이 메서드를 통째로 교체
+    // MapVM
+    private func shouldReload(for region: MKCoordinateRegion) -> Bool {
+        // 팔로우 중엔 더 민감
+        let threshold: CLLocationDistance = (followBusId == nil) ? 180 : 120
+
+        // 첫 호출
+        if lastStopRefreshCenter == nil { return true }
+
+        // 마지막 "정류장/버스" 갱신 중심에서 얼마나 이동했는지
+        let moved = metersBetween(lastStopRefreshCenter, region.center)
+        if moved >= threshold { return true }
+
+        // 줌 급변은 보조 트리거
+        if let prev = lastRegion {
+            let zoomDelta = abs(region.span.latitudeDelta - prev.span.latitudeDelta) /
+                            max(prev.span.latitudeDelta, 0.0001)
+            if zoomDelta >= 0.20 { return true }
+        } else {
+            return true
+        }
+        return false
+    }
+
+
 
     // follow 중인데 새 결과에 그 id가 없으면 유령 샘플 합성
     private func ensureFollowGhost(_ mergedById: inout [String: BusLive]) {
@@ -714,47 +758,117 @@ final class MapVM: ObservableObject {
     }
 
 
+    // ⬇️ 이 메서드를 교체
+    // ⬇️ 이 메서드를 교체
+    // MapVM
     func onRegionCommitted(_ region: MKCoordinateRegion) {
         regionTask?.cancel()
         regionTask = Task { [weak self] in
-            try? await Task.sleep(nanoseconds: 500_000_000)
+            try? await Task.sleep(nanoseconds: 150_000_000) // 0.15s
             guard let self else { return }
-            guard self.shouldReload(for: region) else { return }
-            self.lastRegion = region
-            self.lastReloadAt = Date()
-            await self.reload(center: region.center)
+            if self.shouldReload(for: region) {
+                self.lastRegion = region
+                self.lastReloadAt = Date()
+                // 최신 요청만 유지
+                self.reloadTask?.cancel()
+                self.reloadTask = Task { [weak self] in
+                    await self?.reload(center: region.center)
+                }
+            }
         }
     }
 
+    // MapVM 안에 추가
+    private func nearestStops(from center: CLLocationCoordinate2D,
+                              limit: Int = 4,
+                              within meters: CLLocationDistance = 500) -> [BusStop] {
+        let here = CLLocation(latitude: center.latitude, longitude: center.longitude)
+        return stops
+            .map { stop -> (BusStop, CLLocationDistance) in
+                let d = here.distance(from: CLLocation(latitude: stop.lat, longitude: stop.lon))
+                return (stop, d)
+            }
+            .filter { $0.1 <= meters }
+            .sorted { $0.1 < $1.1 }
+            .prefix(limit)
+            .map { $0.0 }
+    }
+
+
+    @MainActor
     func reload(center: CLLocationCoordinate2D) async {
+        // 최신 요청만 반영하는 외부 취소는 onRegionCommitted에서 처리된다고 가정
+        self.lastStopRefreshCenter = center
+
+        // 1) 정류장: 실패하면 조용히 끝내되, 성공하면 즉시 화면에 반영
         do {
             let stops = try await api.fetchStops(lat: center.latitude, lon: center.longitude)
-            self.stops = stops
-            guard let focus = stops.first else { return }
+            self.stops = stops                         // ✅ 정류장 즉시 적용 (이후 단계 실패해도 유지)
+        } catch {
+            let ns = error as NSError
+            if !(ns.domain == NSURLErrorDomain && ns.code == NSURLErrorCancelled) {
+                print("❌ stops error: \(error)")
+            }
+            // 정류장 없으면 더 진행할 의미가 없음
+            self.latestTopArrivals = []
+            self.buses = []
+            return
+        }
 
-            var arrivals = try await api.fetchArrivalsDetailed(cityCode: CITY_CODE, nodeId: focus.id)
-            arrivals.sort { $0.etaMinutes < $1.etaMinutes }
-            let top = Array(arrivals.prefix(5))
+        // 2) (선택) 반경 500 m 인근 정류장 여러 개 추려서 상위 라우트 산출
+        //    야간엔 여기서 비어도 OK — 정류장은 이미 갱신됨
+        do {
+            // 근처 후보(없으면 곧장 버스 비우고 종료)
+            let candidateStops = nearestStops(from: center, limit: 4, within: 500)
+            guard !candidateStops.isEmpty else {
+                self.latestTopArrivals = []
+                self.buses = []
+                return
+            }
+
+            // 여러 정류장의 도착예정 수집 (ItemsFlex/OneOrMany로 안전 파싱)
+            var all: [ArrivalInfo] = []
+            try await withThrowingTaskGroup(of: [ArrivalInfo].self) { group in
+                for s in candidateStops { group.addTask { try await self.api.fetchArrivalsDetailed(cityCode: CITY_CODE, nodeId: s.id) } }
+                while let arr = try await group.next() { all.append(contentsOf: arr) }
+            }
+
+            // 라우트 중복 제거 + ETA 빠른 것 우선
+            var best: [String: ArrivalInfo] = [:]
+            for a in all { if let cur = best[a.routeId] { if a.etaMinutes < cur.etaMinutes { best[a.routeId] = a } } else { best[a.routeId] = a } }
+            var top = Array(best.values).sorted { $0.etaMinutes < $1.etaMinutes }
+            top = Array(top.prefix(6))
             self.latestTopArrivals = top
 
-            let etaByRoute = Dictionary(uniqueKeysWithValues: top.map { ($0.routeNo, $0.etaMinutes) })
+            // 상위 라우트가 없으면(야간) 버스 목록만 비우고 종료 — 정류장은 그대로
+            guard !top.isEmpty else {
+                self.buses = []
+                return
+            }
 
+            // 버스 위치 조회
+            let etaByRoute = Dictionary(uniqueKeysWithValues: top.map { ($0.routeNo, $0.etaMinutes) })
             var mergedById: [String: BusLive] = [:]
+
             try await withThrowingTaskGroup(of: [BusLive].self) { group in
-                for a in top {
-                    group.addTask { try await self.api.fetchBusLocations(cityCode: CITY_CODE, routeId: a.routeId) }
-                }
+                for a in top { group.addTask { try await self.api.fetchBusLocations(cityCode: CITY_CODE, routeId: a.routeId) } }
                 while let arr = try await group.next() {
-                    let enriched = arr.map { b -> BusLive in var m = b; m.etaMinutes = etaByRoute[m.routeNo]; return m }
+                    let enriched = arr.map { var m = $0; m.etaMinutes = etaByRoute[m.routeNo]; return m }
                     let filtered = self.mergeAndFilter(enriched)
-                    for b in filtered { routeNoById[b.id] = b.routeNo; mergedById[b.id] = b }
+                    for b in filtered { self.routeNoById[b.id] = b.routeNo; mergedById[b.id] = b }
                     self.ensureFollowGhost(&mergedById)
                     self.buses = Array(mergedById.values)
                 }
             }
+
             startAutoRefresh()
         } catch {
-            print("❌ reload error: \(error)")
+            // 네트워크 취소는 무시, 그 외는 로그만 — 정류장 갱신은 이미 화면에 남아있음
+            let ns = error as NSError
+            if ns.domain == NSURLErrorDomain && ns.code == NSURLErrorCancelled { return }
+            print("❌ arrivals/busloc error: \(error)")
+            self.buses = []               // 야간/오류 시 버스만 비움 — 정류장은 유지
+            self.latestTopArrivals = []
         }
     }
 
@@ -1159,19 +1273,14 @@ struct ClusteredMapView: UIViewRepresentable {
         }
 
         // 지도가 움직였을 때: 사용자 제스처가 아니더라도, 팔로우 중이면 주기적으로 정류장 재로딩
+        // ClusteredMapView.Coord
         func mapView(_ mapView: MKMapView, regionDidChangeAnimated animated: Bool) {
-            deb.call(after: 0.5) {
-                // 팔로우 중이면 자동 이동이어도 주기적으로 로드
-                if let fid = self.parent.vm.followBusId, !fid.isEmpty {
-                    self.parent.vm.onRegionCommitted(mapView.region)
-                    return
-                }
-                // 사용자 조작 시에도 로드
-                if mapView.isRegionChangeFromUserInteraction {
-                    self.parent.vm.onRegionCommitted(mapView.region)
-                }
+            deb.call(after: 0.25) {
+                // ✅ 제스처/자동/팔로우 상관없이 항상 통지
+                self.parent.vm.onRegionCommitted(mapView.region)
             }
         }
+
     }
 }
 
@@ -1232,6 +1341,46 @@ struct BusMapScreen: View {
         }
     }
 }
+/// JSON에서 item이 단일 객체이든 배열이든 모두 수용
+/// 배열 또는 단일 객체를 모두 수용
+struct OneOrMany<Element: Decodable>: Decodable {
+    let array: [Element]
+    init(from decoder: Decoder) throws {
+        let c = try decoder.singleValueContainer()
+        if let one = try? c.decode(Element.self) { array = [one] }
+        else { array = try c.decode([Element].self) }
+    }
+}
+
+/// items가 `{ "item": ... }` 이거나 `""`(빈 문자열) 이거나 `null` 이어도 OK
+/// 배열/단일/빈문자열 모두 수용하는 items 디코더
+struct ItemsFlex<Item: Decodable>: Decodable {
+    let values: [Item]
+
+    // ✅ 제네릭 타입은 init 바깥으로
+    private struct Box<T: Decodable>: Decodable {
+        let item: OneOrMany<T>?
+    }
+
+    init(from decoder: Decoder) throws {
+        // 1) 단일값 컨테이너: null 또는 "" → 빈 배열
+        if let sv = try? decoder.singleValueContainer() {
+            if sv.decodeNil() || (try? sv.decode(String.self)) != nil {
+                values = []
+                return
+            }
+        }
+        // 2) 정상 키드 경로: { "item": {...} } 또는 { "item": [ ... ] }
+        if let box = try? Box<Item>(from: decoder) {
+            values = box.item?.array ?? []
+            return
+        }
+        // 3) 혹시 다른 변종이면 안전하게 빈 배열
+        values = []
+    }
+}
+
+
 
 // 고정 추적 배지
 struct TrackingBadgeView: View {
