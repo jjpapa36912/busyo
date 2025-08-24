@@ -683,8 +683,12 @@ final class MapVM: ObservableObject {
     @Published var stops: [BusStop] = []
     @Published var buses: [BusLive] = []
     @Published var followBusId: String?
+    // 게이트/진행도 히스테리시스용 상태
+    private var lastNextStopIndexByBusId: [String: Int] = [:]
+    private var lastProgressSByBusId:    [String: Double] = [:]
+    private var passStreakByBusId:       [String: Int] = [:]
+
     // MapVM 프로퍼티에 추가
-    private var lastNextStopIndexByBusId: [String: Int] = [:]   // busId -> next stop index (routeStops 기준)
 
     // MapVM 안
     private var reloadTask: Task<Void, Never>?
@@ -856,38 +860,85 @@ final class MapVM: ObservableObject {
     ///   3) 통과: 버스가 J를 지나 다음 정류장 방향으로 proj >= passMargin 이면 J+1로 전환
     /// 경로 진행거리 s(미터)로 엄격하게 다음 정류장 결정.
     /// - gatePassMargin: J의 s를 기준으로 그 앞(+방향)으로 최소 몇 m 지나야 J+1로 전환할지
+    /// 경로 진행거리 s(미터) 기반 "다음 정류장" (엄격 게이트 + 히스테리시스)
+    /// - 규칙
+    ///   • 절대 건너뛰기 금지(한 번에 +1만 가능)
+    ///   • J 정류장 게이트(s[J] + margin)를 "연속 N회" 넘어서야 J+1 전환
+    ///   • J에 근접(holdRadius)이면 무조건 J 유지
+    ///   • s가 잠깐 앞섰다 다시 뒤로 가는 노이즈도 무시(진행 증가량 minAdvance 필요)
     private func nextStopFromRoute(
         busId: String,
-        progressS: Double,
+        progressS s: Double,
         routeStops: [BusStop],
         stopS: [Double]
     ) -> BusStop? {
-        guard routeStops.count == stopS.count, !routeStops.isEmpty, progressS.isFinite else { return nil }
 
-        let gatePassMargin: Double = 12    // 게이트 통과 판정(오버슛 최소)
-        let nearStickMeters: Double = 45   // 정류장 근접 유지
-        // 현재 s와 가장 가까운 정류장 index(뒤로 안 밀리도록 상한 보정)
-        var i = (0..<stopS.count).min(by: { abs(stopS[$0]-progressS) < abs(stopS[$1]-progressS) }) ?? 0
+        guard routeStops.count == stopS.count, !routeStops.isEmpty, s.isFinite else { return nil }
 
-        // 이전 선택이 있으면 인접범위 내에서 우선 유지
-        if let cur = lastNextStopIndexByBusId[busId], cur >= 0, cur < stopS.count {
-            // 정류장까지 실제 거리 근사
-            let ds = stopS[cur] - progressS
-            if abs(ds) <= nearStickMeters { i = cur }
-            // 게이트 통과 체크: progressS >= stopS[cur] + margin → 다음으로
-            if progressS >= stopS[cur] + gatePassMargin, cur+1 < stopS.count {
-                lastNextStopIndexByBusId[busId] = cur + 1
-                return routeStops[cur + 1]
-            } else {
-                lastNextStopIndexByBusId[busId] = cur
-                return routeStops[cur]
-            }
+        // 튜닝 파라미터
+        let gateMargin: Double   = 18     // 게이트 통과 최소 오버슛 (m)
+        let holdRadius: Double   = 55     // J 근접 시 무조건 유지 (m)
+        let minAdvance: Double   = 6      // 샘플 간 최소 전진량이 있어야 유효 통과로 인정 (m)
+        let neededStreak: Int    = 2      // 연속 통과 샘플 수(2번 연속 s>=gate + 전진)
+
+        // 0) 초기 next 인덱스 정하기 (s 기준 "다가올" 정류장)
+        func initialIndex(for s: Double) -> Int {
+            // s 이상인 첫 정류장(다가올 정류장). 없으면 마지막.
+            if let idx = stopS.firstIndex(where: { $0 >= s }) { return idx }
+            return stopS.count - 1
         }
 
-        // 초기화: progressS 이전/이후 중 "다음"을 next로
-        while i < stopS.count-1 && progressS > stopS[i] + gatePassMargin { i += 1 }
-        lastNextStopIndexByBusId[busId] = i
-        return routeStops[i]
+        var curIdx = lastNextStopIndexByBusId[busId] ?? initialIndex(for: s)
+        curIdx = max(0, min(curIdx, stopS.count - 1))
+
+        // 상태 읽기/업데이트용
+        let lastS   = lastProgressSByBusId[busId] ?? s
+        let deltaS  = s - lastS
+        lastProgressSByBusId[busId] = s
+
+        // 마지막 정류장이면 더 이동 불가
+        if curIdx >= stopS.count - 1 {
+            lastNextStopIndexByBusId[busId] = curIdx
+            passStreakByBusId[busId] = 0
+            return routeStops[curIdx]
+        }
+
+        // 현재 J, 다음 K
+        let sJ = stopS[curIdx]
+        let sK = stopS[curIdx + 1]
+
+        // 1) J에 충분히 가까우면 J 고정 (GPS/신호등 오차 흡수)
+        let distToJ = abs(sJ - s)
+        if distToJ <= holdRadius {
+            lastNextStopIndexByBusId[busId] = curIdx
+            passStreakByBusId[busId] = 0
+            return routeStops[curIdx]
+        }
+
+        // 2) 게이트 통과 판정: s가 sJ+margin 이상이고, 직전 대비 유의미하게 전진(minAdvance) 했을 때만 카운트
+        let gate = sJ + gateMargin
+        if s >= gate && deltaS >= minAdvance {
+            passStreakByBusId[busId] = (passStreakByBusId[busId] ?? 0) + 1
+        } else {
+            // 한 번이라도 조건을 못 만족하면 스트릭 리셋(튀는 값 방지)
+            passStreakByBusId[busId] = 0
+        }
+
+        // 3) 연속 N회 만족 시에만 +1 전환 (건너뛰기 불가 보장)
+        if (passStreakByBusId[busId] ?? 0) >= neededStreak {
+            curIdx = min(curIdx + 1, stopS.count - 1)
+            passStreakByBusId[busId] = 0
+        }
+
+        // 4) 뒤로 가는 일은 허용하지 않음(노이즈로 s 감소해도 curIdx 유지)
+        //    또한 s가 K를 훌쩍 넘었더라도 한 번에 +1만(다다음 방지)
+        if curIdx < stopS.count - 1 {
+            curIdx = min(curIdx, lastNextStopIndexByBusId[busId] ?? curIdx)
+            curIdx = max(curIdx, lastNextStopIndexByBusId[busId] ?? curIdx) // 실질적으로 변화 없게 유지
+        }
+
+        lastNextStopIndexByBusId[busId] = curIdx
+        return routeStops[curIdx]
     }
 
 
@@ -1306,11 +1357,7 @@ final class MapVM: ObservableObject {
     }
 
     // MARK: - Filtering & snapping
-    // MARK: - Filtering & snapping
-    // MARK: - Filtering & snapping (adaptive jump accept)
-    // MARK: - Filtering & snapping (route-aware + adaptive jump)
-    // MARK: - Filtering & snapping (route-first strict + adaptive jump)
-    // MARK: - Filtering & snapping (route-s projection + strict gate + adaptive jump)
+    // MARK: - Filtering & snapping (route-only, no heuristic fallback)
     private func mergeAndFilter(_ incoming: [BusLive]) -> [BusLive] {
         var out: [BusLive] = []
 
@@ -1333,19 +1380,14 @@ final class MapVM: ObservableObject {
                 // ===== 적응형 점프 허용 =====
                 var acceptAsJump = false
                 if step > maxStepMeters {
-                    // 1) 팔로우 중이면 넉넉히 허용(최대 1.2km)
-                    if isFollowed && step <= FOLLOW_STEP_ALLOW_METERS {
+                    if isFollowed && step <= FOLLOW_STEP_ALLOW_METERS {               // 팔로우 중 넉넉히
                         acceptAsJump = true
-                    }
-                    // 2) 속도 기준으로도 합리적이면 허용(장시간 폴링 공백 후 점프)
-                    else if instMps <= MAX_PLAUSIBLE_MPS {
+                    } else if instMps <= MAX_PLAUSIBLE_MPS {                          // 합리적 속도면 허용
                         acceptAsJump = true
                     }
                 }
-
                 if step > maxStepMeters && !acceptAsJump {
-                    // 비현실적 점프 → 이번 샘플 무시
-                    continue
+                    continue // 비현실적 점프 → 이번 샘플 무시
                 }
 
                 // EMA 스무딩(점프는 리셋에 가깝게 반영)
@@ -1367,77 +1409,53 @@ final class MapVM: ObservableObject {
                 b.lat = pred.latitude
                 b.lon = pred.longitude
 
-                // ======== pred 계산 직후: 경로 사영(s) 기반 전환 ========
+                // ======== 여기부터: 경로 사영(s) 기반 "노선 전용" 계산 ========
 
-                var chosenStop: BusStop? = nil
                 var distToNext: Double? = nil
 
                 if let rid = resolveRouteId(for: b.routeNo) {
-                    // 메타 없으면 비동기로 미리 로드(이번 턴엔 사용 못할 수 있음 → fallback)
+                    // 메타 없으면 비동기 선로딩만 걸고, 이번 프레임은 그대로 유지
                     if routeMetaById[rid] == nil {
                         Task { await ensureRouteMeta(routeId: rid) }
                     }
 
-                    if let meta = routeMetaById[rid] {
-                        // pred를 경로에 사영 → s(진행거리)
-                        if let prj = projectOnRoute(pred, shape: meta.shape, cumul: meta.cumul) {
-                            // s로 엄격 next 결정(게이트/근접 유지)
-                            if let stop = nextStopFromRoute(
-                                busId: b.id,
-                                progressS: prj.s,
-                                routeStops: routeStopsByRouteId[rid] ?? [],
-                                stopS: meta.stopS
-                            ) {
-                                chosenStop = stop
-                                // ETA: s 차이로 계산(경로 상 거리 → GPS 측방 오차에 둔감)
-                                if let idx = routeStopsByRouteId[rid]?.firstIndex(where: { $0.id == stop.id }) {
-                                    let sNext = meta.stopS[idx]
-                                    let remain = max(0, sNext - prj.s)
-                                    distToNext = remain
-                                }
+                    if let meta = routeMetaById[rid],
+                       let prj = projectOnRoute(pred, shape: meta.shape, cumul: meta.cumul),
+                       let routeStops = routeStopsByRouteId[rid],
+                       routeStops.count == meta.stopS.count {
+
+                        // s로 엄격 next 결정(게이트/근접 유지/건너뛰기 금지)
+                        if let stop = nextStopFromRoute(
+                            busId: b.id,
+                            progressS: prj.s,
+                            routeStops: routeStops,
+                            stopS: meta.stopS
+                        ) {
+                            // 이름 갱신
+                            b.nextStopName = stop.name
+
+                            // ETA: s 차이로 계산(경로 상 거리 → GPS 측방 오차에 둔감)
+                            if let idx = routeStops.firstIndex(where: { $0.id == stop.id }) {
+                                let sNext = meta.stopS[idx]
+                                distToNext = max(0, sNext - prj.s)
                             }
-
-                            // (선택) 시각 표시는 pred 유지. lateral 작을 때만 살짝 블렌딩하고 싶으면 주석 해제
-                            // let blend = min(0.3, max(0, 0.3 - prj.lateral / 60))  // 60m 이내만 0~0.3 블렌딩
-                            // b.lat = pred.latitude * (1 - blend) + prj.snapped.latitude * blend
-                            // b.lon = pred.longitude * (1 - blend) + prj.snapped.longitude * blend
                         }
+                        // (선택) 시각 표시는 pred 유지. 필요 시 아래 블렌딩 사용
+                        // let blend = min(0.3, max(0, 0.3 - prj.lateral / 60))
+                        // b.lat = pred.latitude * (1 - blend) + prj.snapped.latitude * blend
+                        // b.lon = pred.longitude * (1 - blend) + prj.snapped.longitude * blend
                     }
                 }
 
-                // 노선 메타가 없거나 실패하면 휴리스틱으로 fallback
-                if chosenStop == nil {
-                    let (heurStop, _) = nextStopAndETA(
-                        busId: b.id,
-                        coord: pred,
-                        track: tr,
-                        fallbackByName: b.nextStopName
-                    )
-                    chosenStop = heurStop
-                    distToNext = chosenStop.map { s in
-                        GeoUtil.deltaMeters(from: pred, to: .init(latitude: s.lat, longitude: s.lon)).dist
-                    }
-                }
-
-                // 이름 반영
-                if let s = chosenStop { b.nextStopName = s.name }
-
-                // ETA 계산(저속 바닥치 + 근거리 0분 스냅) → 스무딩
-                let etaMinRaw: Int? = {
-                    guard let d = distToNext else { return nil }
+                // ETA 계산(노선 메타가 준비된 경우에만). 준비 전에는 이전 ETA를 유지.
+                if let d = distToNext {
                     let vObs = max(0.1, tr.speedMps)
-                    let vForETA = max(1.5, vObs)  // 신호대기 과대증가 방지
+                    let vForETA = max(1.5, vObs)          // 신호대기 과대증가 방지
                     var sec = Int(d / vForETA)
-                    if vObs < 1.2 && d < 25 { sec = 0 }
-                    return max(0, Int((Double(sec)/60.0).rounded(.toNearestOrEven)))
-                }()
-
-                b.etaMinutes = smoothETA(
-                    rawETA: etaMinRaw,
-                    busId: b.id,
-                    distToNextStop: distToNext
-                )
-
+                    if vObs < 1.2 && d < 25 { sec = 0 }   // 근거리 저속 0분 스냅
+                    let etaMinRaw = max(0, Int((Double(sec)/60.0).rounded(.toNearestOrEven)))
+                    b.etaMinutes = smoothETA(rawETA: etaMinRaw, busId: b.id, distToNextStop: d)
+                }
                 // ======== 여기까지 ========
 
             } else {
@@ -1455,7 +1473,9 @@ final class MapVM: ObservableObject {
     }
 
 
+
     // ⬇️ 이 메서드를 교체
+    // MapVM
     private func maybeSnapToStop(_ b: inout BusLive) {
         let here = CLLocation(latitude: b.lat, longitude: b.lon)
 
@@ -1485,24 +1505,34 @@ final class MapVM: ObservableObject {
             return
         }
 
-        // 속도에 따라 스냅 반경 확장
-        let speed: Double = {
-            if let tr = tracks[b.id] { return tr.speedMps }
-            return 0
-        }()
-        let baseRadius: CLLocationDistance = snapRadius          // 기존 18
-        let slowBonus: CLLocationDistance = (speed < 1.0) ? 20 : (speed < 2.0 ? 10 : 0)
-        let dwellBonus: CLLocationDistance = ((dwellUntil[b.id] ?? .distantPast) > Date()) ? 25 : 0
-        let dynamicRadius = baseRadius + slowBonus + dwellBonus  // 보통 18~63m
+        // ✅ 팔로우 여부 확인
+        let isFollowed = (followBusId == b.id)
 
-        if d < dynamicRadius {
-            // 정류장 체류 모드 시작/연장
-            dwellUntil[b.id] = Date().addingTimeInterval(dwellSec)
-            b.lat = stop.lat; b.lon = stop.lon
+        if d < snapRadius {
+            let until = dwellUntil[b.id] ?? .distantPast
+            // 팔로우 중이면 정류장 좌표로 '정확히' 스냅하지 않고 7m 앞쪽으로 아주 조금 이동
+            if isFollowed {
+                let mLat = GeoUtil.metersPerDegLat(at: stop.lat)
+                let mLon = GeoUtil.metersPerDegLon(at: stop.lat)
+
+                // 진행 방향 추정(최근 트랙 기준)
+                let dir = tracks[b.id]?.dirUnit ?? (x: 0.0, y: 1.0)
+                let ahead: Double = 7.0
+                let dLat = (ahead * dir.y) / mLat
+                let dLon = (ahead * dir.x) / mLon
+
+                b.lat = stop.lat + dLat
+                b.lon = stop.lon + dLon
+            } else {
+                // 기존 로직 유지
+                b.lat = stop.lat
+                b.lon = stop.lon
+            }
+
             b.nextStopName = stop.name
             b.etaMinutes = 0
+            dwellUntil[b.id] = max(until, Date().addingTimeInterval(dwellSec))
         } else {
-            // 반경 밖: 최근 업데이트가 없거나 dwell 만료되면 해제
             let recentOk: Bool = {
                 if let tr = tracks[b.id] { return Date().timeIntervalSince(tr.lastAt) < 2 * TimeInterval(BUS_REFRESH_SEC) }
                 return false
@@ -1513,6 +1543,9 @@ final class MapVM: ObservableObject {
         }
     }
 
+    
+    
+    
 }
 
 // MARK: - Map helpers
@@ -1570,7 +1603,9 @@ struct ClusteredMapView: UIViewRepresentable {
         let stopsToAdd    = desiredStops.filter { !currentStopIds.contains($0.id) }.map { BusStopAnnotation($0) }
         let stopsToRemove = currentStops.filter { !desiredStopIds.contains($0.stop.id) }
 
-        var busAnnoById = Dictionary(uniqueKeysWithValues: currentBuses.map { ($0.id, $0) })
+        var busAnnoById = Dictionary(uniqueKeysWithValues: currentBuses
+            .filter { !$0.id.isEmpty }
+            .map { ($0.id, $0) })
         var busesToAdd: [BusAnnotation] = []
         var busesToRemove: [BusAnnotation] = []
         var busUpdates: [(BusAnnotation, BusLive)] = []
@@ -1583,7 +1618,7 @@ struct ClusteredMapView: UIViewRepresentable {
             }
         }
         for leftover in busAnnoById.values {
-            if let sel = vm.followBusId, sel == leftover.id { continue }
+            if let sel = vm.followBusId, sel == leftover.id { continue } // ✅ 팔로우 삭제 금지
             let stillDesired = desiredBuses.contains { $0.id == leftover.id }
             if stillDesired { continue }
             busesToRemove.append(leftover)
@@ -1625,20 +1660,60 @@ struct ClusteredMapView: UIViewRepresentable {
         private let deb = Debouncer()
         private var isAutoRecentering = false
         private var isApplyingDiff = false
+        private var isTweakingFollowAppearance = false    // 재진입/중복 호출 가드
+
 
         init(_ p: ClusteredMapView) { parent = p }
 
         // 추적 색상 일괄 반영
         func updateFollowTints(_ mapView: MKMapView) {
-            let followed = parent.vm.followBusId
-            for anno in mapView.annotations {
-                guard let a = anno as? BusAnnotation,
-                      let v = mapView.view(for: a) as? BusMarkerView else { continue }
-                v.configureTint(isFollowed: (a.id == followed))
+            // MapKit이 내부에서 enumerate 중일 수 있으므로, diff/애니메이션 중이면 잠깐 뒤로 미룸
+            if isApplyingDiff || isTweakingFollowAppearance {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self, weak mapView] in
+                    guard let self, let mapView else { return }
+                    self.updateFollowTints(mapView)
+                }
+                return
             }
+
+            isTweakingFollowAppearance = true
+
+            // ✅ 스냅샷을 떠서 열거 중 뮤테이션 방지
+            let annoSnapshot: [MKAnnotation] = Array(mapView.annotations)
+
+            UIView.performWithoutAnimation {
+                CATransaction.begin()
+                CATransaction.setDisableActions(true)
+
+                let followed = parent.vm.followBusId
+
+                for anno in annoSnapshot {
+                    guard let a = anno as? BusAnnotation,
+                          let v = mapView.view(for: a) as? BusMarkerView else { continue }
+
+                    let isFollowed = (a.id == followed)
+
+                    // 팔로우 중 버스는 절대 클러스터에 합쳐지지 않도록 "고유" ID 사용(= nil 금지)
+                    let newClusterId = isFollowed ? "bus-\(a.id)" : "bus"
+                    if v.clusteringIdentifier != newClusterId {
+                        v.clusteringIdentifier = newClusterId
+                    }
+
+                    v.configureTint(isFollowed: isFollowed)
+                    v.displayPriority = .required
+                    v.layer.zPosition = 10
+                }
+
+                CATransaction.commit()
+            }
+
+            isTweakingFollowAppearance = false
         }
 
+
+
         // diff 적용 (delegate 잠시 분리)
+        // ClusteredMapView.Coord
         func applyAnnotationDiff(
             on mapView: MKMapView,
             stopsToAdd: [MKAnnotation],
@@ -1653,22 +1728,49 @@ struct ClusteredMapView: UIViewRepresentable {
             DispatchQueue.main.async { [weak self, weak mapView] in
                 guard let self, let mapView else { return }
 
+                // ===== 안전 필터링: 제거해도 되는 것만 남긴다 =====
+                // 1) 현재 맵에 있는 것만 제거 대상으로 (스냅샷)
+                let present = Set(mapView.annotations.map { ObjectIdentifier($0) })
+
+                // 2) 이번 틱에 업데이트되는 버스는 제거 금지
+                let updatingBusIds = Set(busUpdates.map { $0.0.id })
+
+                // 3) 팔로우/선택된 버스 제거 금지
+                let followedId = self.parent.vm.followBusId
+                let selectedIds = Set(mapView.selectedAnnotations.compactMap { ($0 as? BusAnnotation)?.id })
+
+                // 4) 실제 제거 리스트 재구성
+                let safeStopsToRemove = stopsToRemove.filter { present.contains(ObjectIdentifier($0)) }
+
+                let safeBusesToRemove: [MKAnnotation] = busesToRemove.compactMap { a in
+                    guard present.contains(ObjectIdentifier(a)) else { return nil }
+                    guard let b = a as? BusAnnotation else { return a } // 혹시 타입이 다르면 그대로 진행
+                    if let fid = followedId, fid == b.id { return nil }        // 팔로우 금지
+                    if selectedIds.contains(b.id) { return nil }                // 선택중 금지
+                    if updatingBusIds.contains(b.id) { return nil }             // 업데이트 대상 금지
+                    return b
+                }
+
                 let oldDelegate = mapView.delegate
                 mapView.delegate = nil
 
+                // ===== add/remove: 애니메이션/암시적 트랜잭션 비활성화 =====
                 UIView.performWithoutAnimation {
                     CATransaction.begin()
                     CATransaction.setDisableActions(true)
-                    if !stopsToRemove.isEmpty || !busesToRemove.isEmpty {
-                        mapView.removeAnnotations(stopsToRemove + busesToRemove)
+
+                    if !safeStopsToRemove.isEmpty || !safeBusesToRemove.isEmpty {
+                        mapView.removeAnnotations(safeStopsToRemove + safeBusesToRemove)
                     }
+
                     if !stopsToAdd.isEmpty || !busesToAdd.isEmpty {
                         mapView.addAnnotations(stopsToAdd + busesToAdd)
                     }
+
                     CATransaction.commit()
                 }
 
-                // 좌표/데이터 업데이트 + 콜아웃/서브타이틀 즉시 갱신
+                // ===== 업데이트(좌표/라벨) =====
                 if !busUpdates.isEmpty {
                     CATransaction.begin()
                     CATransaction.setAnimationDuration(0.9)
@@ -1685,8 +1787,12 @@ struct ClusteredMapView: UIViewRepresentable {
                 mapView.layoutIfNeeded()
                 mapView.delegate = oldDelegate
                 self.isApplyingDiff = false
+
+                // ✅ 안전망: 팔로우 외형(클러스터링/색/Z) 재적용 — 내부 열거 충돌 방지 위해 지연 없음
+                self.updateFollowTints(mapView)
             }
         }
+
 
         func centerOn(_ center: CLLocationCoordinate2D, mapView: MKMapView, animated: Bool) {
             isAutoRecentering = true
@@ -1709,35 +1815,46 @@ struct ClusteredMapView: UIViewRepresentable {
         }
 
         // 뷰 팩토리
+        // ClusteredMapView.Coord
         func mapView(_ mapView: MKMapView, viewFor annotation: MKAnnotation) -> MKAnnotationView? {
             if let s = annotation as? BusStopAnnotation {
                 let v = mapView.dequeueReusableAnnotationView(withIdentifier: "stop", for: s) as! MKMarkerAnnotationView
                 v.clusteringIdentifier = "stop"
                 v.glyphText = "🚏"
                 v.markerTintColor = .systemRed
-                v.displayPriority = .defaultLow     // 👈 버스가 우선
+                v.displayPriority = .defaultLow
                 v.layer.zPosition = 1
                 v.titleVisibility = .adaptive
                 return v
+
             } else if let b = annotation as? BusAnnotation {
                 let v = mapView.dequeueReusableAnnotationView(withIdentifier: "bus", for: b) as! BusMarkerView
-                v.clusteringIdentifier = "bus"
-                v.configureTint(isFollowed: (parent.vm.followBusId == b.id))
-                // 콜아웃 버튼
+
+                let isFollowed = (parent.vm.followBusId == b.id)
+                v.clusteringIdentifier = isFollowed ? "bus-\(b.id)" : "bus" // ✅ nil 금지
+                v.configureTint(isFollowed: isFollowed)
+                v.displayPriority = .required
+                v.layer.zPosition = 10
+
                 v.canShowCallout = true
                 let btn = UIButton(type: .system)
-                let following = (parent.vm.followBusId == b.id)
-                btn.setTitle(following ? "해제" : "추적", for: .normal)
+                btn.setTitle(isFollowed ? "해제" : "추적", for: .normal)
                 btn.titleLabel?.font = .systemFont(ofSize: 14, weight: .semibold)
                 v.rightCalloutAccessoryView = btn
-                // 초기 라벨 세팅
-                v.updateAlwaysOnBubble()  // ⬅️ 말풍선 즉시 갱신
+
+                v.updateAlwaysOnBubble()
                 return v
+
             } else if annotation is MKClusterAnnotation {
-                return mapView.dequeueReusableAnnotationView(withIdentifier: MKMapViewDefaultClusterAnnotationViewReuseIdentifier, for: annotation)
+                return mapView.dequeueReusableAnnotationView(
+                    withIdentifier: MKMapViewDefaultClusterAnnotationViewReuseIdentifier,
+                    for: annotation
+                )
             }
             return nil
         }
+
+
 
         // **탭 토글**: 같은 버스를 다시 누르면 해제, 해제 후 다시 누르면 재추적
         func mapView(_ mapView: MKMapView, didSelect view: MKAnnotationView) {
@@ -1751,7 +1868,17 @@ struct ClusteredMapView: UIViewRepresentable {
                 parent.vm.followBusId = bus.id
                 follow(bus, on: mapView)
                 if let mv = view as? BusMarkerView { mv.configureTint(isFollowed: true); mv.updateAlwaysOnBubble() }
+                // ✅ 바로 호출 대신 다음 런루프로 미룸(열거 충돌 방지)
+                DispatchQueue.main.async { [weak self, weak mapView] in
+                    guard let self, let mapView else { return }
+                    self.updateFollowTints(mapView)
+                }
 
+                // didDeselect / calloutAccessoryControlTapped 토글 후에도 동일하게:
+                DispatchQueue.main.async { [weak self, weak mapView] in
+                    guard let self, let mapView else { return }
+                    self.updateFollowTints(mapView)
+                }
                 // ✅ 노선 정류장 목록 사전 로드
                 Task { await self.parent.vm.onBusSelected(bus) }
             }
