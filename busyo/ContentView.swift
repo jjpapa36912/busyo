@@ -1394,33 +1394,35 @@ struct ClusteredMapView: UIViewRepresentable {
         }
 
         // **탭 토글**: 같은 버스를 다시 누르면 해제, 해제 후 다시 누르면 재추적
+        // ClusteredMapView.Coord
         func mapView(_ mapView: MKMapView, didSelect view: MKAnnotationView) {
             guard let bus = view.annotation as? BusAnnotation else { return }
+
             let already = (parent.vm.followBusId == bus.id)
             if already {
-                // → 추적 해제
+                // 해제
                 parent.vm.followBusId = nil
-                UIView.animate(withDuration: 0.2) { view.transform = .identity }
                 if let mv = view as? BusMarkerView { mv.configureTint(isFollowed: false) }
-                mapView.deselectAnnotation(bus, animated: true)
-                return
+            } else {
+                // 새 추적 시작
+                parent.vm.followBusId = bus.id
+                follow(bus, on: mapView) // 화면 따라가기 로직은 유지
+                if let mv = view as? BusMarkerView {
+                    mv.configureTint(isFollowed: true)
+                    mv.updateAlwaysOnBubble()
+                }
             }
-            // → 새 추적 시작
-            UIView.animate(withDuration: 0.2) { view.transform = CGAffineTransform(scaleX: 1.35, y: 1.35) }
-            parent.vm.followBusId = bus.id
-            follow(bus, on: mapView)
-            if let mv = view as? BusMarkerView {
-                mv.configureTint(isFollowed: true)
-                mv.updateAlwaysOnBubble()
-                if let btn = mv.rightCalloutAccessoryView as? UIButton { btn.setTitle("해제", for: .normal) }
-            }
+
+            // ✅ 선택 상태 UI를 즉시 제거(작은 원/하이라이트 방지)
+            mapView.deselectAnnotation(bus, animated: false)
         }
 
+
         func mapView(_ mapView: MKMapView, didDeselect view: MKAnnotationView) {
-            if view is BusMarkerView {
-                UIView.animate(withDuration: 0.2) { view.transform = .identity }
-                // 버튼 라벨은 선택 해제와 무관 (토글은 didSelect/callout에서만)
-            }
+//            if view is BusMarkerView {
+//                UIView.animate(withDuration: 0.2) { view.transform = .identity }
+//                // 버튼 라벨은 선택 해제와 무관 (토글은 didSelect/callout에서만)
+//            }
         }
 
         // 콜아웃 버튼으로도 토글
