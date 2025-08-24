@@ -115,6 +115,53 @@ final class BusAPI: NSObject, URLSessionDelegate {
                     completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void) {
         completionHandler(.performDefaultHandling, nil)
     }
+    // 노선 경로(위경도 점열) 조회
+    func fetchRoutePath(cityCode: Int, routeId: String) async throws -> [CLLocationCoordinate2D] {
+        // 국토부: BusRouteInfoInqireService/getRoutePathList
+        let url = try urlWithEncodedKey(
+            base: "https://apis.data.go.kr/1613000/BusRouteInfoInqireService/getRoutePathList",
+            items: [
+                .init(name: "pageNo", value: "1"),
+                .init(name: "numOfRows", value: "1000"),
+                .init(name: "_type", value: "json"),
+                .init(name: "type", value: "json"),
+                .init(name: "cityCode", value: String(cityCode)),
+                .init(name: "routeId", value: routeId)
+            ])
+
+        struct Root: Decodable {
+            struct Resp: Decodable { let body: Body? }
+            struct Body: Decodable { let items: ItemsFlex<Item>? }
+            struct Item: Decodable {
+                let gpsLati: FlexDouble?
+                let gpsLong: FlexDouble?
+                enum CodingKeys: String, CodingKey { case gpsLati, gpsLong, gpslati, gpslong }
+                init(from d: Decoder) throws {
+                    let c = try d.container(keyedBy: CodingKeys.self)
+                    gpsLati = (try? c.decode(FlexDouble.self, forKey: .gpsLati)) ?? (try? c.decode(FlexDouble.self, forKey: .gpslati))
+                    gpsLong = (try? c.decode(FlexDouble.self, forKey: .gpsLong)) ?? (try? c.decode(FlexDouble.self, forKey: .gpslong))
+                }
+            }
+            let response: Resp?
+        }
+
+        let (data, _) = try await send("RoutePath", url: url)
+        if isLikelyXML(data) {
+            let arr = try parseXMLItems(data)
+            return arr.compactMap { d in
+                guard let la = toDouble(d["gpslati"]) ?? toDouble(d["gpsLati"]),
+                      let lo = toDouble(d["gpslong"]) ?? toDouble(d["gpsLong"]) else { return nil }
+                return .init(latitude: la, longitude: lo)
+            }
+        } else {
+            let r = try JSONDecoder().decode(Root.self, from: data)
+            let items = r.response?.body?.items?.values ?? []
+            return items.compactMap {
+                guard let la = $0.gpsLati?.value, let lo = $0.gpsLong?.value else { return nil }
+                return .init(latitude: la, longitude: lo)
+            }
+        }
+    }
 
     // BusAPI 안에 추가
     func fetchStopsByRoute(cityCode: Int, routeId: String) async throws -> [BusStop] {
@@ -636,6 +683,9 @@ final class MapVM: ObservableObject {
     @Published var stops: [BusStop] = []
     @Published var buses: [BusLive] = []
     @Published var followBusId: String?
+    // MapVM 프로퍼티에 추가
+    private var lastNextStopIndexByBusId: [String: Int] = [:]   // busId -> next stop index (routeStops 기준)
+
     // MapVM 안
     private var reloadTask: Task<Void, Never>?
     // MapVM 안에 추가
@@ -681,6 +731,102 @@ final class MapVM: ObservableObject {
     // MapVM 프로퍼티 (캐시)
     private var routeStopsByRouteId: [String: [BusStop]] = [:]
     
+    // MARK: Route meta & matcher cache
+    private struct RouteMeta {
+        let shape: [CLLocationCoordinate2D]  // 폴리라인 점열
+        let cumul: [Double]                  // 각 점까지 누적거리(미터)
+        let stopIds: [String]
+        let stopCoords: [CLLocationCoordinate2D]
+        let stopS: [Double]                  // 각 정류장 투영 진행거리 s(미터)
+    }
+    private var routeMetaById: [String: RouteMeta] = [:]
+
+    // 폴리라인 누적거리 테이블 생성
+    private func buildCumul(_ pts: [CLLocationCoordinate2D]) -> [Double] {
+        guard !pts.isEmpty else { return [] }
+        var out: [Double] = [0]
+        for i in 1..<pts.count {
+            let d = CLLocation(latitude: pts[i-1].latitude, longitude: pts[i-1].longitude)
+                .distance(from: CLLocation(latitude: pts[i].latitude, longitude: pts[i].longitude))
+            out.append(out.last! + d)
+        }
+        return out
+    }
+
+    // 점을 폴리라인에 사영(세그먼트 클램프). s=경로 진행거리, lateral=경로와의 수직거리
+    private func projectOnRoute(_ p: CLLocationCoordinate2D,
+                                shape: [CLLocationCoordinate2D],
+                                cumul: [Double]) -> (snapped: CLLocationCoordinate2D, s: Double, seg: Int, lateral: Double)? {
+        guard shape.count >= 2, shape.count == cumul.count else { return nil }
+        var best: (snapped: CLLocationCoordinate2D, s: Double, seg: Int, lateral: Double)? = nil
+
+        for i in 0..<(shape.count-1) {
+            let a = shape[i], b = shape[i+1]
+            let va = GeoUtil.deltaMeters(from: a, to: p)
+            let ab = GeoUtil.deltaMeters(from: a, to: b)
+            let abLen2 = max(1e-6, ab.dx*ab.dx + ab.dy*ab.dy)
+            var t = (va.dx*ab.dx + va.dy*ab.dy) / abLen2
+            t = max(0, min(1, t))
+            let px = ab.dx * t, py = ab.dy * t
+            let snapped = CLLocationCoordinate2D(latitude: a.latitude + (py/GeoUtil.metersPerDegLat(at: a.latitude)),
+                                                 longitude: a.longitude + ((px)/GeoUtil.metersPerDegLon(at: a.latitude)))
+            let lateral = hypot(va.dx - px, va.dy - py)
+            let s = cumul[i] + sqrt(min(abLen2, ab.dx*ab.dx + ab.dy*ab.dy)) * t
+            if best == nil || lateral < best!.lateral {
+                best = (snapped, s, i, lateral)
+            }
+        }
+        return best
+    }
+
+    // 정류장 좌표들을 경로 s로 변환
+    private func stopsProjectedS(_ stops: [BusStop], shape: [CLLocationCoordinate2D], cumul: [Double]) -> [Double] {
+        stops.map { s in
+            let p = CLLocationCoordinate2D(latitude: s.lat, longitude: s.lon)
+            if let prj = projectOnRoute(p, shape: shape, cumul: cumul) { return prj.s }
+            return .infinity
+        }
+    }
+
+    // routeId의 RouteMeta 보장(없으면 fetch)
+    // MapVM 안
+    private func ensureRouteMeta(routeId: String) async {
+        // 이미 있으면 종료
+        if routeMetaById[routeId] != nil { return }
+
+        do {
+            // 1) 정류장 목록: 캐시 있으면 사용, 없으면 fetch
+            let stops: [BusStop]
+            if let cached = routeStopsByRouteId[routeId] {
+                stops = cached
+            } else {
+                let fetched = try await api.fetchStopsByRoute(cityCode: CITY_CODE, routeId: routeId)
+                routeStopsByRouteId[routeId] = fetched
+                stops = fetched
+            }
+
+            // 2) 노선 경로(폴리라인)
+            let shape = try await api.fetchRoutePath(cityCode: CITY_CODE, routeId: routeId)
+
+            // 3) 누적거리/정류장 s 계산
+            let cumul = buildCumul(shape)
+            let stopS = stopsProjectedS(stops, shape: shape, cumul: cumul)
+
+            // 4) 메타 캐시 저장
+            routeMetaById[routeId] = RouteMeta(
+                shape: shape,
+                cumul: cumul,
+                stopIds: stops.map { $0.id },
+                stopCoords: stops.map { .init(latitude: $0.lat, longitude: $0.lon) },
+                stopS: stopS
+            )
+        } catch {
+            print("❌ ensureRouteMeta(\(routeId)) error: \(error)")
+        }
+    }
+
+
+    
     // routeNo -> routeId 해석
     private func resolveRouteId(for routeNo: String) -> String? {
         if let id = routeIdByRouteNo[routeNo] { return id }
@@ -697,51 +843,52 @@ final class MapVM: ObservableObject {
     // 버스 선택 시: 해당 노선의 정류장 목록을 캐시에 로드
     func onBusSelected(_ bus: BusAnnotation) async {
         guard let rid = resolveRouteId(for: bus.routeNo) else { return }
-        if routeStopsByRouteId[rid] != nil { return } // 캐시 있으면 스킵
-        do {
-            let stops = try await api.fetchStopsByRoute(cityCode: CITY_CODE, routeId: rid)
-            routeStopsByRouteId[rid] = stops
-        } catch {
-            print("❌ route stops load error: \(error)")
-        }
+        // 정류장/경로 메타 모두 보장
+        await ensureRouteMeta(routeId: rid)
     }
+
     
     // MapVM 안에 추가: 노선 정류장 배열 기반으로 다음 정류장 추정
+    /// 노선 정류장 배열 기반으로 "다음 정류장"을 엄격하게 계산.
+    /// - 규칙:
+    ///   1) 초기화: 가장 가까운 정류장 기준으로 진행방향을 보아 next 후보를 정함
+    ///   2) 유지: 현재 next(J) 앞의 "게이트"(J를 지나는 수직선) 통과 전에는 J를 계속 유지
+    ///   3) 통과: 버스가 J를 지나 다음 정류장 방향으로 proj >= passMargin 이면 J+1로 전환
+    /// 경로 진행거리 s(미터)로 엄격하게 다음 정류장 결정.
+    /// - gatePassMargin: J의 s를 기준으로 그 앞(+방향)으로 최소 몇 m 지나야 J+1로 전환할지
     private func nextStopFromRoute(
         busId: String,
-        busCoord: CLLocationCoordinate2D,
-        track: BusTrack,
+        progressS: Double,
         routeStops: [BusStop],
-        lastStopId: String?
+        stopS: [Double]
     ) -> BusStop? {
-        guard !routeStops.isEmpty else { return nil }
+        guard routeStops.count == stopS.count, !routeStops.isEmpty, progressS.isFinite else { return nil }
 
-        // 1) 가장 가까운 정류장 index
-        let idx = routeStops.enumerated().min { lhs, rhs in
-            let dl = GeoUtil.deltaMeters(from: busCoord, to: .init(latitude: lhs.element.lat, longitude: lhs.element.lon)).dist
-            let dr = GeoUtil.deltaMeters(from: busCoord, to: .init(latitude: rhs.element.lat, longitude: rhs.element.lon)).dist
-            return dl < dr
-        }?.offset ?? 0
+        let gatePassMargin: Double = 12    // 게이트 통과 판정(오버슛 최소)
+        let nearStickMeters: Double = 45   // 정류장 근접 유지
+        // 현재 s와 가장 가까운 정류장 index(뒤로 안 밀리도록 상한 보정)
+        var i = (0..<stopS.count).min(by: { abs(stopS[$0]-progressS) < abs(stopS[$1]-progressS) }) ?? 0
 
-        // 2) 진행 방향으로 다음 index 선택
-        var nextIdx = idx
-        if let d = track.dirUnit, idx + 1 < routeStops.count {
-            let v = GeoUtil.deltaMeters(from: busCoord, to: .init(latitude: routeStops[idx+1].lat, longitude: routeStops[idx+1].lon))
-            let dot = v.dx*d.x + v.dy*d.y
-            if dot > 0 { nextIdx = idx + 1 }
+        // 이전 선택이 있으면 인접범위 내에서 우선 유지
+        if let cur = lastNextStopIndexByBusId[busId], cur >= 0, cur < stopS.count {
+            // 정류장까지 실제 거리 근사
+            let ds = stopS[cur] - progressS
+            if abs(ds) <= nearStickMeters { i = cur }
+            // 게이트 통과 체크: progressS >= stopS[cur] + margin → 다음으로
+            if progressS >= stopS[cur] + gatePassMargin, cur+1 < stopS.count {
+                lastNextStopIndexByBusId[busId] = cur + 1
+                return routeStops[cur + 1]
+            } else {
+                lastNextStopIndexByBusId[busId] = cur
+                return routeStops[cur]
+            }
         }
 
-        // 3) 히스테리시스: 최근 선택값이 인접해 있으면 유지
-        if let last = lastStopId, let lastIdx = routeStops.firstIndex(where: { $0.id == last }),
-           abs(lastIdx - nextIdx) <= 1 {
-            return routeStops[lastIdx]
-        }
-
-        // 4) 최종 선택 기록
-        lastPredictedStopId[busId] = routeStops[nextIdx].id
-        return routeStops[nextIdx]
+        // 초기화: progressS 이전/이후 중 "다음"을 next로
+        while i < stopS.count-1 && progressS > stopS[i] + gatePassMargin { i += 1 }
+        lastNextStopIndexByBusId[busId] = i
+        return routeStops[i]
     }
-
 
 
     // ETA 스무딩
@@ -1162,6 +1309,8 @@ final class MapVM: ObservableObject {
     // MARK: - Filtering & snapping
     // MARK: - Filtering & snapping (adaptive jump accept)
     // MARK: - Filtering & snapping (route-aware + adaptive jump)
+    // MARK: - Filtering & snapping (route-first strict + adaptive jump)
+    // MARK: - Filtering & snapping (route-s projection + strict gate + adaptive jump)
     private func mergeAndFilter(_ incoming: [BusLive]) -> [BusLive] {
         var out: [BusLive] = []
 
@@ -1218,63 +1367,78 @@ final class MapVM: ObservableObject {
                 b.lat = pred.latitude
                 b.lon = pred.longitude
 
-                // ========= 여기부터: 노선 기반 → 휴리스틱 fallback =========
+                // ======== pred 계산 직후: 경로 사영(s) 기반 전환 ========
 
-                // ① 노선 기반 다음 정류장 우선 시도
-                var nextStopFromRouteList: BusStop? = nil
-                if let rid = resolveRouteId(for: b.routeNo),
-                   let rStops = routeStopsByRouteId[rid] {
-                    nextStopFromRouteList = nextStopFromRoute(
-                        busId: b.id,
-                        busCoord: pred,
-                        track: tr,
-                        routeStops: rStops,
-                        lastStopId: lastPredictedStopId[b.id]
-                    )
+                var chosenStop: BusStop? = nil
+                var distToNext: Double? = nil
+
+                if let rid = resolveRouteId(for: b.routeNo) {
+                    // 메타 없으면 비동기로 미리 로드(이번 턴엔 사용 못할 수 있음 → fallback)
+                    if routeMetaById[rid] == nil {
+                        Task { await ensureRouteMeta(routeId: rid) }
+                    }
+
+                    if let meta = routeMetaById[rid] {
+                        // pred를 경로에 사영 → s(진행거리)
+                        if let prj = projectOnRoute(pred, shape: meta.shape, cumul: meta.cumul) {
+                            // s로 엄격 next 결정(게이트/근접 유지)
+                            if let stop = nextStopFromRoute(
+                                busId: b.id,
+                                progressS: prj.s,
+                                routeStops: routeStopsByRouteId[rid] ?? [],
+                                stopS: meta.stopS
+                            ) {
+                                chosenStop = stop
+                                // ETA: s 차이로 계산(경로 상 거리 → GPS 측방 오차에 둔감)
+                                if let idx = routeStopsByRouteId[rid]?.firstIndex(where: { $0.id == stop.id }) {
+                                    let sNext = meta.stopS[idx]
+                                    let remain = max(0, sNext - prj.s)
+                                    distToNext = remain
+                                }
+                            }
+
+                            // (선택) 시각 표시는 pred 유지. lateral 작을 때만 살짝 블렌딩하고 싶으면 주석 해제
+                            // let blend = min(0.3, max(0, 0.3 - prj.lateral / 60))  // 60m 이내만 0~0.3 블렌딩
+                            // b.lat = pred.latitude * (1 - blend) + prj.snapped.latitude * blend
+                            // b.lon = pred.longitude * (1 - blend) + prj.snapped.longitude * blend
+                        }
+                    }
                 }
 
-                // 휴리스틱(방향/반경)도 병행 계산해 둔다
-                let (nextStopHeur, etaHeur) = nextStopAndETA(
-                    busId: b.id,
-                    coord: pred,
-                    track: tr,
-                    fallbackByName: b.nextStopName
-                )
+                // 노선 메타가 없거나 실패하면 휴리스틱으로 fallback
+                if chosenStop == nil {
+                    let (heurStop, _) = nextStopAndETA(
+                        busId: b.id,
+                        coord: pred,
+                        track: tr,
+                        fallbackByName: b.nextStopName
+                    )
+                    chosenStop = heurStop
+                    distToNext = chosenStop.map { s in
+                        GeoUtil.deltaMeters(from: pred, to: .init(latitude: s.lat, longitude: s.lon)).dist
+                    }
+                }
 
-                // ② 최종 next/ETA 선택: 노선기반 우선, 없으면 휴리스틱
-                let chosenStop: BusStop? = nextStopFromRouteList ?? nextStopHeur
+                // 이름 반영
                 if let s = chosenStop { b.nextStopName = s.name }
 
-                // 다음 정류장까지의 거리
-                let distToNext: Double? = chosenStop.map { s in
-                    GeoUtil.deltaMeters(
-                        from: pred,
-                        to: .init(latitude: s.lat, longitude: s.lon)
-                    ).dist
-                }
-
-                // 원시 ETA 산출: 노선기반을 우선 사용, 없으면 휴리스틱 ETA
+                // ETA 계산(저속 바닥치 + 근거리 0분 스냅) → 스무딩
                 let etaMinRaw: Int? = {
-                    if chosenStop != nil, let d = distToNext {
-                        // ETA 계산(저속 바닥치 + 근거리 보정)
-                        let vObs = max(0.1, tr.speedMps)
-                        let vForETA = max(1.5, vObs)
-                        var sec = Int(d / vForETA)
-                        if vObs < 1.2 && d < 25 { sec = 0 }
-                        return max(0, Int((Double(sec)/60.0).rounded(.toNearestOrEven)))
-                    } else {
-                        return etaHeur
-                    }
+                    guard let d = distToNext else { return nil }
+                    let vObs = max(0.1, tr.speedMps)
+                    let vForETA = max(1.5, vObs)  // 신호대기 과대증가 방지
+                    var sec = Int(d / vForETA)
+                    if vObs < 1.2 && d < 25 { sec = 0 }
+                    return max(0, Int((Double(sec)/60.0).rounded(.toNearestOrEven)))
                 }()
 
-                // ETA 스무딩 적용
                 b.etaMinutes = smoothETA(
                     rawETA: etaMinRaw,
                     busId: b.id,
                     distToNextStop: distToNext
                 )
 
-                // ========= 여기까지 =========
+                // ======== 여기까지 ========
 
             } else {
                 // 첫 관측: 트랙 생성(다음 루프부터 스무딩/예측)
