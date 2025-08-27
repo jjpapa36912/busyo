@@ -162,7 +162,44 @@ final class BusAPI: NSObject, URLSessionDelegate {
             }
         }
     }
+    // 대전시: 노선별 버스 위치
+        func fetchBusLocationsDaejeon(routeId: String) async throws -> [BusLive] {
+            // 보통 기능명 붙여 호출: .../busposinfo/getBusPosByRtid
+            guard var comps = URLComponents(string: "https://openapittraffic.daejeon.go.kr/api/rest/busposinfo/getBusPosByRtid") else {
+                throw APIError.invalidURL
+            }
+            comps.queryItems = [
+                URLQueryItem(name: "serviceKey", value: serviceKeyRaw.encodedForServiceKey),  // ✅ Encoding 키
+                URLQueryItem(name: "busRouteId", value: routeId)
+            ]
+            guard let url = comps.url else { throw APIError.invalidURL }
 
+            let (data, _) = try await send("BusLoc(DJ)", url: url)
+
+            // XML only → 기존 XMLItemsParser 재사용
+            let arr = try parseXMLItems(data)
+
+            // 필드명이 지역별로 조금씩 달라 확장적으로 파싱
+            // 흔한 케이스: vehicleno, routeno, nodeNm / gpsX,gpsY 또는 wgs84Lon,wgs84Lat, gpsLong,gpsLati
+            func dbl(_ d: [String:String], _ keys: [String]) -> Double? {
+                for k in keys { if let v = d[k] ?? d[k.lowercased()], let x = Double(v) { return x } }
+                return nil
+            }
+            func str(_ d: [String:String], _ keys: [String]) -> String? {
+                for k in keys { if let v = d[k] ?? d[k.lowercased()], !v.isEmpty { return v } }
+                return nil
+            }
+
+            return arr.compactMap { d in
+                let veh = str(d, ["vehicleno","carNo","carno"]) ?? ""
+                let rno = str(d, ["routeno","routenm","routeNo","routeNm"]) ?? "?"
+                let lat = dbl(d, ["gpsLati","gpsY","wgs84Lat","lat"])
+                let lon = dbl(d, ["gpsLong","gpsX","wgs84Lon","lon"])
+                guard !veh.isEmpty, let la = lat, let lo = lon else { return nil }
+                let nextNm = str(d, ["nodeNm","nodenm","nextStop","stationNm"])
+                return BusLive(id: veh, routeNo: rno, lat: la, lon: lo, etaMinutes: nil, nextStopName: nextNm)
+            }
+        }
     // BusAPI 안에 추가
     func fetchStopsByRoute(cityCode: Int, routeId: String) async throws -> [BusStop] {
         // 국토부: BusRouteInfoInqireService/getRouteAcctoThrghSttnList
@@ -373,7 +410,7 @@ final class BusAPI: NSObject, URLSessionDelegate {
         }
     }
 
-    // 3) 노선별 버스 위치
+
     func fetchBusLocations(cityCode: Int, routeId: String) async throws -> [BusLive] {
         let url = try urlWithEncodedKey(
             base: "https://apis.data.go.kr/1613000/BusLcInfoInqireService/getRouteAcctoBusLcList",
@@ -687,6 +724,12 @@ final class MapVM: ObservableObject {
     private var lastNextStopIndexByBusId: [String: Int] = [:]
     private var lastProgressSByBusId:    [String: Double] = [:]
     private var passStreakByBusId:       [String: Int] = [:]
+    // MapVM 안에 추가
+    private var lastETAMinByBusId: [String: Int] = [:]
+    // MapVM 안에 추가
+    private var lastSByBusId: [String: Double] = [:]        // 마지막 진행거리 s
+    private var lastStopIdByBusId: [String: String] = [:]   // 마지막으로 고른 nextStop
+
 
     // MapVM 프로퍼티에 추가
 
@@ -734,9 +777,40 @@ final class MapVM: ObservableObject {
     private var lastETA: [String: (eta: Int, at: Date)] = [:]
     // MapVM 프로퍼티 (캐시)
     private var routeStopsByRouteId: [String: [BusStop]] = [:]
-    
+    // ✅ epoch 게이팅
+       private var epochCounter: UInt64 = 0
+       private var latestAppliedEpoch: UInt64 = 0
+
+       // 읽기 전용 스냅샷 타입
+       struct RouteSnapshot {
+           let metaById: [String: RouteMeta]          // 이미 가지고 있는 타입
+           let stopsByRouteId: [String: [BusStop]]
+       }
+
+       // 현재 보유 데이터로 스냅샷 만들기
+       private func makeRouteSnapshot() -> RouteSnapshot {
+           return RouteSnapshot(metaById: routeMetaById, stopsByRouteId: routeStopsByRouteId)
+       }
+
+       // 주어진 epoch 가 최신일 때만 상태 반영
+       private func applyIfCurrent(epoch: UInt64, _ apply: () -> Void) {
+           if epoch >= latestAppliedEpoch {
+               latestAppliedEpoch = epoch
+               apply()
+           }
+       }
+
+       // (선택) 팔로우 시작 시 노선 프리페치
+       func prefetchFollowedRouteIfNeeded(routeId: String) {
+           Task { [weak self] in
+               guard let self else { return }
+               if self.routeMetaById[routeId] == nil {
+                   try? await self.ensureRouteMeta(routeId: routeId)
+               }
+           }
+       }
     // MARK: Route meta & matcher cache
-    private struct RouteMeta {
+    struct RouteMeta {
         let shape: [CLLocationCoordinate2D]  // 폴리라인 점열
         let cumul: [Double]                  // 각 점까지 누적거리(미터)
         let stopIds: [String]
@@ -744,6 +818,66 @@ final class MapVM: ObservableObject {
         let stopS: [Double]                  // 각 정류장 투영 진행거리 s(미터)
     }
     private var routeMetaById: [String: RouteMeta] = [:]
+
+    /// 경로 진행도 s 기반 '엄격' 다음 정류장 판정
+    /// - busId: 차량 식별(히스테리시스 상태 유지용)
+    /// - progressS: 경로 폴리라인에 사영한 현재 진행거리(미터)
+    /// - routeStops: 노선의 정류장 배열
+    /// - stopS: 각 정류장의 경로상 거리 s 배열 (routeStops와 같은 순서, shape/cumul로 만든 값)
+    /// - lateral: 경로로부터의 횡오차(미터) - 너무 크면 판정을 급변시키지 않음
+    /// 노선 기반 "다음 정류장" 엄격 판정
+    /// - busId: 차량 고유 id
+    /// - progressS: 경로에 사영된 현재 진행거리 s (미터)
+    /// - routeStops: 노선상의 정류장 배열
+    /// - stopS: 각 정류장의 경로상 누적거리(s) (routeStops와 인덱스 일치)
+    /// - lateral: 경로로부터의 측방 오차(미터)
+    // MapVM 안
+    private func nextStopFromRouteStrict(
+        busId: String,
+        progressS: Double,
+        routeStops: [BusStop],
+        stopS: [Double],
+        lateral: Double
+    ) -> BusStop? {
+        guard !routeStops.isEmpty, routeStops.count == stopS.count else { return nil }
+
+        // 1) s 역행 억제(최대 20m만 허용)
+        let sPrev = lastSByBusId[busId] ?? progressS
+        let sNow  = max(progressS, sPrev - 20)
+
+        // 2) 게이트
+        let AHEAD_GATE = max(18.0, min(50.0, 12.0 + 0.35 * lateral))
+        let lastIdx: Int? = {
+            guard let sid = lastStopIdByBusId[busId] else { return nil }
+            return routeStops.firstIndex(where: { $0.id == sid })
+        }()
+
+        // 3) sNow + 게이트를 넘는 첫 정류장을 후보로
+        var candIdx: Int? = nil
+        for i in 0..<stopS.count {
+            if stopS[i] > sNow + AHEAD_GATE { candIdx = i; break }
+        }
+
+        // 4) 히스테리시스(한 정거장씩만 전진)
+        if let li = lastIdx, let ci = candIdx, ci > li + 1 {
+            candIdx = li + 1
+        }
+
+        // 5) 채택/유지
+        if let ci = candIdx {
+            let chosen = routeStops[ci]
+            lastSByBusId[busId] = max(sPrev, sNow)
+            lastStopIdByBusId[busId] = chosen.id
+            return chosen
+        } else if let li = lastIdx {
+            lastSByBusId[busId] = max(sPrev, sNow)
+            return routeStops[li]
+        } else {
+            lastSByBusId[busId] = max(sPrev, sNow)
+            return nil
+        }
+    }
+
 
     // 폴리라인 누적거리 테이블 생성
     private func buildCumul(_ pts: [CLLocationCoordinate2D]) -> [Double] {
@@ -1187,111 +1321,113 @@ final class MapVM: ObservableObject {
 
     @MainActor
     func reload(center: CLLocationCoordinate2D) async {
-        // 최신 요청만 반영하는 외부 취소는 onRegionCommitted에서 처리된다고 가정
+        // 새 사이클 시작 → epoch 발급
+        epochCounter &+= 1
+        let epoch = epochCounter
         self.lastStopRefreshCenter = center
 
-        // 1) 정류장: 실패하면 조용히 끝내되, 성공하면 즉시 화면에 반영
+        // 1) 정류장 먼저 (성공 즉시 반영)
         do {
             let stops = try await api.fetchStops(lat: center.latitude, lon: center.longitude)
-            self.stops = stops                         // ✅ 정류장 즉시 적용 (이후 단계 실패해도 유지)
+            applyIfCurrent(epoch: epoch) {
+                self.stops = stops
+            }
         } catch {
             let ns = error as NSError
             if !(ns.domain == NSURLErrorDomain && ns.code == NSURLErrorCancelled) {
                 print("❌ stops error: \(error)")
             }
-            // 정류장 없으면 더 진행할 의미가 없음
-            self.latestTopArrivals = []
-            self.buses = []
+            applyIfCurrent(epoch: epoch) {
+                self.latestTopArrivals = []
+                self.buses = []
+            }
             return
         }
 
-        // 2) 반경 500 m 인근 정류장 여러 개 추려서 상위 라우트 산출
+        // 2) 후보 정류장 → 도착정보
         do {
-            // 근처 후보(없으면 곧장 버스 비우고 종료)
-            let candidateStops = nearestStops(from: center, limit: 4, within: 500)
-            guard !candidateStops.isEmpty else {
-                self.latestTopArrivals = []
-                self.buses = []
+            let candidates = nearestStops(from: center, limit: 4, within: 500)
+            guard !candidates.isEmpty else {
+                applyIfCurrent(epoch: epoch) {
+                    self.latestTopArrivals = []
+                    self.buses = []
+                }
                 return
             }
 
-            // 여러 정류장의 도착예정 수집 (ItemsFlex/OneOrMany로 안전 파싱)
             var allArrivals: [ArrivalInfo] = []
             try await withThrowingTaskGroup(of: [ArrivalInfo].self) { group in
-                for s in candidateStops {
+                for s in candidates {
                     group.addTask { try await self.api.fetchArrivalsDetailed(cityCode: CITY_CODE, nodeId: s.id) }
                 }
                 while let arr = try await group.next() { allArrivals.append(contentsOf: arr) }
             }
 
-            // ---------- ⬇️ 여기부터 '팔로우 노선 강제 포함' 로직 통합 ----------
-            // 1) 라우트별 최소 ETA만 남기기 + 이번 회차 매핑 갱신
+            // 라우트별 최소 ETA
             routeIdByRouteNo.removeAll(keepingCapacity: true)
-            var bestByRouteId: [String: ArrivalInfo] = [:]
+            var best: [String: ArrivalInfo] = [:]
             for a in allArrivals {
-                // routeno -> routeId 매핑 업데이트
                 routeIdByRouteNo[a.routeNo] = a.routeId
-                lastKnownRouteIdByRouteNo[a.routeNo] = a.routeId   // 캐시에 누적
-
-                if let cur = bestByRouteId[a.routeId] {
-                    if a.etaMinutes < cur.etaMinutes { bestByRouteId[a.routeId] = a }
+                lastKnownRouteIdByRouteNo[a.routeNo] = a.routeId
+                if let cur = best[a.routeId] {
+                    if a.etaMinutes < cur.etaMinutes { best[a.routeId] = a }
                 } else {
-                    bestByRouteId[a.routeId] = a
+                    best[a.routeId] = a
                 }
             }
-
-            var top = Array(bestByRouteId.values).sorted { $0.etaMinutes < $1.etaMinutes }
-
-            // 2) 팔로우 중이면 그 버스 라우트를 반드시 포함
+            var top = Array(best.values).sorted { $0.etaMinutes < $1.etaMinutes }
+            // 팔로우 노선 강제 포함
             if let fid = followBusId, let rno = routeNoById[fid] {
-                let forcedRouteId =
-                    routeIdByRouteNo[rno] ??            // 이번 회차에서 찾았거나
-                    lastKnownRouteIdByRouteNo[rno]      // 과거 캐시에 있던 것(신호등/야간 대비)
-                if let fr = forcedRouteId, !top.contains(where: { $0.routeId == fr }) {
-                    // ETA는 임시값(기존 표시 유지용); 실제 위치가 오면 덮임
+                if let fr = routeIdByRouteNo[rno] ?? lastKnownRouteIdByRouteNo[rno],
+                   !top.contains(where: { $0.routeId == fr }) {
                     top.insert(.init(routeId: fr, routeNo: rno, etaMinutes: 3), at: 0)
                 }
             }
+            top = Array(top.prefix(6))
+            applyIfCurrent(epoch: epoch) {
+                self.latestTopArrivals = top
+            }
 
-            // 3) 너무 많으면 상한
-            let TOP_ROUTE_LIMIT = 6
-            top = Array(top.prefix(TOP_ROUTE_LIMIT))
-            self.latestTopArrivals = top
-
-            // 상위 라우트가 없으면(야간) 버스 목록만 비우고 종료 — 정류장은 그대로
             guard !top.isEmpty else {
-                self.buses = []
+                applyIfCurrent(epoch: epoch) { self.buses = [] }
                 return
             }
 
-            // 4) 상위 라우트들로 BusLoc 병렬 조회
+            // ✅ 이 사이클에서 사용할 "일관 스냅샷" 고정
+            let snap = makeRouteSnapshot()
             let etaByRoute = Dictionary(uniqueKeysWithValues: top.map { ($0.routeNo, $0.etaMinutes) })
-            var mergedById: [String: BusLive] = [:]
 
+            var mergedById: [String: BusLive] = [:]
             try await withThrowingTaskGroup(of: [BusLive].self) { group in
                 for a in top {
                     group.addTask { try await self.api.fetchBusLocations(cityCode: CITY_CODE, routeId: a.routeId) }
                 }
                 while let arr = try await group.next() {
-                    let enriched = arr.map { b -> BusLive in var m = b; m.etaMinutes = etaByRoute[m.routeNo]; return m }
-                    let filtered = self.mergeAndFilter(enriched)
+                    let enriched = arr.map { var m = $0; m.etaMinutes = etaByRoute[m.routeNo]; return m }
+                    let filtered = self.mergeAndFilter(enriched, snap: snap) // 👈 스냅샷 주입
                     for b in filtered { self.routeNoById[b.id] = b.routeNo; mergedById[b.id] = b }
                     self.ensureFollowGhost(&mergedById)
-                    self.buses = Array(mergedById.values)
+
+                    // 이 사이클(epoch) 결과만 반영
+                    applyIfCurrent(epoch: epoch) {
+                        self.buses = Array(mergedById.values)
+                    }
                 }
             }
-            // ---------- ⬆️ 여기까지 ----------
 
-            startAutoRefresh()
+            startAutoRefresh()  // 그대로
         } catch {
-            // 네트워크 취소는 무시, 그 외는 로그만 — 정류장 갱신은 이미 화면에 남아있음
             let ns = error as NSError
-            if ns.domain == NSURLErrorDomain && ns.code == NSURLErrorCancelled { return }
-            print("❌ arrivals/busloc error: \(error)")
-            self.buses = []               // 야간/오류 시 버스만 비움 — 정류장은 유지
-            self.latestTopArrivals = []
+            if ns.domain != NSURLErrorDomain || ns.code != NSURLErrorCancelled {
+                print("❌ arrivals/busloc error: \(error)")
+            }
+            applyIfCurrent(epoch: epoch) {
+                self.buses = []
+                self.latestTopArrivals = []
+            }
         }
     }
+
 
 
     private func startAutoRefresh() {
@@ -1311,59 +1447,111 @@ final class MapVM: ObservableObject {
         isRefreshing = true
         defer { isRefreshing = false }
 
-        var top = latestTopArrivals
+        // 새 에폭
+        epochCounter &+= 1
+        let epoch = epochCounter
 
-        // 팔로우 노선 강제 포함
-        if let fid = followBusId, let rno = routeNoById[fid] {
-            let forcedRouteId = routeIdByRouteNo[rno] ?? lastKnownRouteIdByRouteNo[rno]
-            if let fr = forcedRouteId, !top.contains(where: { $0.routeId == fr }) {
-                top.insert(.init(routeId: fr, routeNo: rno, etaMinutes: 3), at: 0)
-            }
-        }
+        let top = latestTopArrivals
+        guard !top.isEmpty else { return }
 
-        guard !top.isEmpty else {
-            // 버스 응답이 비어도 팔로우 유령은 유지되도록 buses를 바로 비우지 않음
-            var merged: [String: BusLive] = Dictionary(uniqueKeysWithValues: self.buses.map { ($0.id, $0) })
-            self.ensureFollowGhost(&merged)
-            self.buses = Array(merged.values)
-            return
-        }
+        let snap = makeRouteSnapshot()
+        let etaByRoute = Dictionary(uniqueKeysWithValues: top.map { ($0.routeNo, $0.etaMinutes) })
+        var mergedById: [String: BusLive] = Dictionary(uniqueKeysWithValues: self.buses.map { ($0.id, $0) })
 
         do {
-            let etaByRoute = Dictionary(uniqueKeysWithValues: top.map { ($0.routeNo, $0.etaMinutes) })
-            var mergedById: [String: BusLive] = Dictionary(uniqueKeysWithValues: self.buses.map { ($0.id, $0) })
-
             try await withThrowingTaskGroup(of: [BusLive].self) { group in
-                for a in top {
-                    group.addTask { try await self.api.fetchBusLocations(cityCode: CITY_CODE, routeId: a.routeId) }
-                }
+                for a in top { group.addTask { try await self.api.fetchBusLocations(cityCode: CITY_CODE, routeId: a.routeId) } }
                 while let arr = try await group.next() {
-                    let enriched = arr.map { b -> BusLive in var m = b; m.etaMinutes = etaByRoute[m.routeNo]; return m }
-                    let filtered = self.mergeAndFilter(enriched)
+                    let enriched = arr.map { var m = $0; m.etaMinutes = etaByRoute[m.routeNo]; return m }
+                    let filtered = self.mergeAndFilter(enriched, snap: snap) // 👈 동일
                     for b in filtered { self.routeNoById[b.id] = b.routeNo; mergedById[b.id] = b }
                     self.ensureFollowGhost(&mergedById)
-                    self.buses = Array(mergedById.values)
+                    applyIfCurrent(epoch: epoch) {
+                        self.buses = Array(mergedById.values)
+                    }
                 }
             }
-        } catch {
-            let ns = error as NSError
-            if ns.domain == NSURLErrorDomain && ns.code == NSURLErrorCancelled { return }
-            print("❌ refresh error: \(error)")
-            // 실패 시에도 팔로우 유령 유지
-            var merged: [String: BusLive] = Dictionary(uniqueKeysWithValues: self.buses.map { ($0.id, $0) })
-            self.ensureFollowGhost(&merged)
-            self.buses = Array(merged.values)
-        }
+        } catch { /* 무음 */ }
     }
 
-    // MARK: - Filtering & snapping
-    // MARK: - Filtering & snapping (route-only, no heuristic fallback)
-    private func mergeAndFilter(_ incoming: [BusLive]) -> [BusLive] {
+    
+    private var lastPassedStopIndex: [String: Int] = [:]
+    /// 단순 방향 기반 정류장 통과 판정
+    private func hasPassedStop(bus: CLLocationCoordinate2D,
+                               stop: CLLocationCoordinate2D,
+                               direction: CGPoint) -> Bool {
+        // 주 진행방향이 동서(E-W)인지 남북(N-S)인지 결정
+        if abs(direction.x) > abs(direction.y) {
+            // 동서 이동
+            if direction.x > 0 {
+                // 동쪽(경도 증가) → 정류소 경도보다 버스 경도가 크면 통과
+                return bus.longitude > stop.longitude
+            } else {
+                // 서쪽(경도 감소) → 정류소 경도보다 버스 경도가 작으면 통과
+                return bus.longitude < stop.longitude
+            }
+        } else {
+            // 남북 이동
+            if direction.y > 0 {
+                // 북쪽(위도 증가)
+                return bus.latitude > stop.latitude
+            } else {
+                // 남쪽(위도 감소)
+                return bus.latitude < stop.latitude
+            }
+        }
+    }
+    // 버스별 "다음 정류장 index"를 기억(단조 증가, 절대 후퇴 없음)
+    // 버스별 현재 노선(routeId) 기억(초기화용)
+    private var busRouteIdByBusId: [String: String] = [:]
+    /// 노선 위 진행거리 s 와 정류장 누적거리 배열 stopS 를 비교해
+    /// '다음 정류장'의 index 를 단조 증가로 갱신한다.
+    private func monotonicNextStopIndex(
+        busId: String,
+        routeId: String,
+        progressS: Double,
+        lateralMeters: Double,
+        stopsCount: Int,
+        stopS: [Double]
+    ) -> Int {
+        // 경로에서 너무 벗어나 있으면(병렬 도로 등) index 고정
+        let lateralMax: Double = 120.0
+        if lateralMeters > lateralMax, let keep = lastNextStopIndexByBusId[busId] {
+            return keep
+        }
+
+        // 초기화: s와 가장 가까운 정류장을 기준으로 다음 정류장 가정
+        let currentIdx: Int = {
+            if let cached = lastNextStopIndexByBusId[busId] { return cached }
+            // s와 stopS 차이가 최소인 지점
+            let j = stopS.enumerated().min(by: { abs($0.element - progressS) < abs($1.element - progressS) })?.offset ?? 0
+            // 이미 j를 충분히 지난 상태면 j+1부터 시작
+            let gate: Double = 20.0 // 20m 지나야 '지남' 인정
+            return min(j + (progressS > stopS[j] + gate ? 1 : 0), stopsCount - 1)
+        }()
+
+        var idx = currentIdx
+        let gate: Double = 20.0 // s가 stopS[idx]+gate 를 넘으면 다음으로 진급
+        while idx < stopsCount - 1, progressS >= stopS[idx] + gate {
+            idx += 1
+        }
+
+        lastNextStopIndexByBusId[busId] = idx
+        busRouteIdByBusId[busId] = routeId
+        return idx
+    }
+
+    // ⬇️ MapVM 안에 그대로 교체
+    // MapVM 안에 있던 기존 함수 정의를 이걸로 교체
+    private func mergeAndFilter(_ incoming: [BusLive], snap: RouteSnapshot) -> [BusLive] {
         var out: [BusLive] = []
 
-        // 합리적 최고 속도(144km/h), 팔로우 중 점프 허용 상한(1.2km)
         let MAX_PLAUSIBLE_MPS: Double = 40.0
         let FOLLOW_STEP_ALLOW_METERS: CLLocationDistance = 1_200
+
+        let PASS_EPS_M: Double = 18
+        let LATERAL_OK_M: Double = 60
+        let STICKY_BACKBLOCK: Bool = true
 
         for var b in incoming {
             let now = Date()
@@ -1371,32 +1559,23 @@ final class MapVM: ObservableObject {
             let isFollowed = (followBusId == b.id)
 
             if var tr = tracks[b.id] {
-                // 직전 상태 기준 거리/시간
                 let step = CLLocation(latitude: tr.lastLoc.latitude, longitude: tr.lastLoc.longitude)
                     .distance(from: CLLocation(latitude: rawC.latitude, longitude: rawC.longitude))
                 let dt = max(0.01, now.timeIntervalSince(tr.lastAt))
                 let instMps = step / dt
 
-                // ===== 적응형 점프 허용 =====
                 var acceptAsJump = false
                 if step > maxStepMeters {
-                    if isFollowed && step <= FOLLOW_STEP_ALLOW_METERS {               // 팔로우 중 넉넉히
-                        acceptAsJump = true
-                    } else if instMps <= MAX_PLAUSIBLE_MPS {                          // 합리적 속도면 허용
-                        acceptAsJump = true
-                    }
+                    if isFollowed && step <= FOLLOW_STEP_ALLOW_METERS { acceptAsJump = true }
+                    else if instMps <= MAX_PLAUSIBLE_MPS { acceptAsJump = true }
                 }
-                if step > maxStepMeters && !acceptAsJump {
-                    continue // 비현실적 점프 → 이번 샘플 무시
-                }
+                if step > maxStepMeters && !acceptAsJump { continue }
 
-                // EMA 스무딩(점프는 리셋에 가깝게 반영)
                 let alpha: Double = acceptAsJump ? 0.9 : emaAlpha
                 let lat = tr.lastLoc.latitude  * (1 - alpha) + rawC.latitude  * alpha
                 let lon = tr.lastLoc.longitude * (1 - alpha) + rawC.longitude * alpha
                 let smooth = CLLocationCoordinate2D(latitude: lat, longitude: lon)
 
-                // 트랙 갱신 + 속도/방향 업데이트
                 tr.prevLoc = tr.lastLoc
                 tr.prevAt  = tr.lastAt
                 tr.lastLoc = smooth
@@ -1404,69 +1583,71 @@ final class MapVM: ObservableObject {
                 tr.updateKinematics()
                 tracks[b.id] = tr
 
-                // 짧은 예측(Dead-reckoning)
                 let pred = tr.predicted(at: now.addingTimeInterval(0.6))
-                b.lat = pred.latitude
-                b.lon = pred.longitude
 
-                // ======== 여기부터: 경로 사영(s) 기반 "노선 전용" 계산 ========
+                // ✅ 스냅샷 사용
+                var progressS: Double? = nil
+                var lateralM: Double?  = nil
+                if let rid = resolveRouteId(for: b.routeNo),
+                   let meta = snap.metaById[rid],
+                   let rStops = snap.stopsByRouteId[rid],
+                   let prj = projectOnRoute(pred, shape: meta.shape, cumul: meta.cumul) {
 
-                var distToNext: Double? = nil
+                    b.lat = prj.snapped.latitude
+                    b.lon = prj.snapped.longitude
+                    progressS = prj.s
+                    lateralM  = prj.lateral
 
-                if let rid = resolveRouteId(for: b.routeNo) {
-                    // 메타 없으면 비동기 선로딩만 걸고, 이번 프레임은 그대로 유지
-                    if routeMetaById[rid] == nil {
-                        Task { await ensureRouteMeta(routeId: rid) }
-                    }
+                    let stopS = meta.stopS
+                    let count = min(stopS.count, rStops.count)
+                    guard count > 0 else { out.append(b); continue }
 
-                    if let meta = routeMetaById[rid],
-                       let prj = projectOnRoute(pred, shape: meta.shape, cumul: meta.cumul),
-                       let routeStops = routeStopsByRouteId[rid],
-                       routeStops.count == meta.stopS.count {
+                    var lastIdx = lastPassedStopIndex[b.id] ?? -1
+                    if STICKY_BACKBLOCK { lastIdx = max(-1, lastIdx) }
 
-                        // s로 엄격 next 결정(게이트/근접 유지/건너뛰기 금지)
-                        if let stop = nextStopFromRoute(
-                            busId: b.id,
-                            progressS: prj.s,
-                            routeStops: routeStops,
-                            stopS: meta.stopS
-                        ) {
-                            // 이름 갱신
-                            b.nextStopName = stop.name
-
-                            // ETA: s 차이로 계산(경로 상 거리 → GPS 측방 오차에 둔감)
-                            if let idx = routeStops.firstIndex(where: { $0.id == stop.id }) {
-                                let sNext = meta.stopS[idx]
-                                distToNext = max(0, sNext - prj.s)
-                            }
+                    if let latErr = lateralM, latErr <= LATERAL_OK_M, let s = progressS {
+                        var newPassed = lastIdx
+                        while newPassed + 1 < count && (s - stopS[newPassed + 1]) >= PASS_EPS_M {
+                            newPassed += 1
                         }
-                        // (선택) 시각 표시는 pred 유지. 필요 시 아래 블렌딩 사용
-                        // let blend = min(0.3, max(0, 0.3 - prj.lateral / 60))
-                        // b.lat = pred.latitude * (1 - blend) + prj.snapped.latitude * blend
-                        // b.lon = pred.longitude * (1 - blend) + prj.snapped.longitude * blend
+                        if STICKY_BACKBLOCK { newPassed = max(newPassed, lastIdx) }
+
+                        lastPassedStopIndex[b.id] = newPassed
+
+                        let nextIdx = min(newPassed + 1, count - 1)
+                        let nextStop = rStops[nextIdx]
+                        b.nextStopName = nextStop.name
+
+                        let remain = max(0, stopS[nextIdx] - s)
+                        let vObs = max(0.1, tr.speedMps)
+                        let vForETA = max(1.5, vObs)
+                        var sec = Int(remain / vForETA)
+                        if vObs < 1.2 && remain < 25 { sec = 0 }
+                        let rawETA = max(0, Int((Double(sec)/60.0).rounded(.toNearestOrEven)))
+
+                        if let e = smoothETA(rawETA: rawETA, busId: b.id, distToNextStop: remain) {
+                            b.etaMinutes = e
+                            lastETAMinByBusId[b.id] = e
+                        } else if let prev = lastETAMinByBusId[b.id] {
+                            b.etaMinutes = prev
+                        }
+
+                    } else {
+                        if let prev = lastETAMinByBusId[b.id] { b.etaMinutes = prev }
                     }
+
+                } else {
+                    b.lat = pred.latitude
+                    b.lon = pred.longitude
+                    if let prev = lastETAMinByBusId[b.id] { b.etaMinutes = prev }
                 }
 
-                // ETA 계산(노선 메타가 준비된 경우에만). 준비 전에는 이전 ETA를 유지.
-                if let d = distToNext {
-                    let vObs = max(0.1, tr.speedMps)
-                    let vForETA = max(1.5, vObs)          // 신호대기 과대증가 방지
-                    var sec = Int(d / vForETA)
-                    if vObs < 1.2 && d < 25 { sec = 0 }   // 근거리 저속 0분 스냅
-                    let etaMinRaw = max(0, Int((Double(sec)/60.0).rounded(.toNearestOrEven)))
-                    b.etaMinutes = smoothETA(rawETA: etaMinRaw, busId: b.id, distToNextStop: d)
-                }
-                // ======== 여기까지 ========
-
+                maybeSnapToStop(&b)
+                out.append(b)
             } else {
-                // 첫 관측: 트랙 생성(다음 루프부터 스무딩/예측)
                 tracks[b.id] = BusTrack(prevLoc: nil, prevAt: nil, lastLoc: rawC, lastAt: now)
+                out.append(b)
             }
-
-            // 정류장 스냅/드웰 적용(정확히 붙이기)
-            maybeSnapToStop(&b)
-
-            out.append(b)
         }
 
         return out
@@ -1474,70 +1655,42 @@ final class MapVM: ObservableObject {
 
 
 
+
     // ⬇️ 이 메서드를 교체
     // MapVM
+    // MapVM 안
     private func maybeSnapToStop(_ b: inout BusLive) {
-        let here = CLLocation(latitude: b.lat, longitude: b.lon)
-
-        func nearest(to name: String?) -> (BusStop, CLLocationDistance)? {
-            if let n = name {
-                let cands = stops.filter { $0.name.contains(n) || n.contains($0.name) }
-                if let best = cands.min(by: {
-                    here.distance(from: CLLocation(latitude: $0.lat, longitude: $0.lon)) <
-                    here.distance(from: CLLocation(latitude: $1.lat, longitude: $1.lon))
-                }) {
-                    let d = here.distance(from: CLLocation(latitude: best.lat, longitude: best.lon))
-                    return (best, d)
-                }
-            }
-            if let best = stops.min(by: {
-                here.distance(from: CLLocation(latitude: $0.lat, longitude: $0.lon)) <
-                here.distance(from: CLLocation(latitude: $1.lat, longitude: $1.lon))
-            }) {
-                let d = here.distance(from: CLLocation(latitude: best.lat, longitude: best.lon))
-                return (best, d)
-            }
-            return nil
-        }
-
-        guard let (stop, d) = nearest(to: b.nextStopName) else {
+        // 다음 정류장 이름이 없으면 스냅하지 않음(이전처럼 임의 근접 정류장으로 바꾸지 않음)
+        guard let nextName = b.nextStopName else {
             if let until = dwellUntil[b.id], until < Date() { dwellUntil.removeValue(forKey: b.id) }
             return
         }
 
-        // ✅ 팔로우 여부 확인
-        let isFollowed = (followBusId == b.id)
+        // 오직 '선택된 다음 정류장'만 대상으로 삼는다
+        guard let target = stops.first(where: { $0.name == nextName ||
+                                                nextName.contains($0.name) ||
+                                                $0.name.contains(nextName) }) else {
+            // 이름 매칭되는 정류장이 현재 반경 목록에 없으면 아무 것도 하지 않음
+            if let until = dwellUntil[b.id], until < Date() { dwellUntil.removeValue(forKey: b.id) }
+            return
+        }
+
+        let here = CLLocation(latitude: b.lat, longitude: b.lon)
+        let d = here.distance(from: CLLocation(latitude: target.lat, longitude: target.lon))
 
         if d < snapRadius {
+            // 스냅 + 드웰 (ETA는 0으로 고정)
             let until = dwellUntil[b.id] ?? .distantPast
-            // 팔로우 중이면 정류장 좌표로 '정확히' 스냅하지 않고 7m 앞쪽으로 아주 조금 이동
-            if isFollowed {
-                let mLat = GeoUtil.metersPerDegLat(at: stop.lat)
-                let mLon = GeoUtil.metersPerDegLon(at: stop.lat)
-
-                // 진행 방향 추정(최근 트랙 기준)
-                let dir = tracks[b.id]?.dirUnit ?? (x: 0.0, y: 1.0)
-                let ahead: Double = 7.0
-                let dLat = (ahead * dir.y) / mLat
-                let dLon = (ahead * dir.x) / mLon
-
-                b.lat = stop.lat + dLat
-                b.lon = stop.lon + dLon
-            } else {
-                // 기존 로직 유지
-                b.lat = stop.lat
-                b.lon = stop.lon
+            if until < Date() {
+                dwellUntil[b.id] = Date().addingTimeInterval(dwellSec)
             }
-
-            b.nextStopName = stop.name
+            b.lat = target.lat
+            b.lon = target.lon
+            b.nextStopName = target.name
             b.etaMinutes = 0
-            dwellUntil[b.id] = max(until, Date().addingTimeInterval(dwellSec))
         } else {
-            let recentOk: Bool = {
-                if let tr = tracks[b.id] { return Date().timeIntervalSince(tr.lastAt) < 2 * TimeInterval(BUS_REFRESH_SEC) }
-                return false
-            }()
-            if let until = dwellUntil[b.id], until < Date() || !recentOk {
+            // 반경을 벗어났고 드웰이 끝났으면 해제 (이름은 건드리지 않음)
+            if let until = dwellUntil[b.id], until < Date() {
                 dwellUntil.removeValue(forKey: b.id)
             }
         }
@@ -1547,6 +1700,8 @@ final class MapVM: ObservableObject {
     
     
 }
+enum BusProvider { case motie /*국토부*/, daejeon }
+private let provider: BusProvider = .daejeon   // ← 임시로 대전 active
 
 // MARK: - Map helpers
 private extension MKMapView {
@@ -1822,38 +1977,107 @@ struct ClusteredMapView: UIViewRepresentable {
                 v.clusteringIdentifier = "stop"
                 v.glyphText = "🚏"
                 v.markerTintColor = .systemRed
-                v.displayPriority = .defaultLow
-                v.layer.zPosition = 1
-                v.titleVisibility = .adaptive
+
+                // ✅ 정류소도 버스와 '동급' 레벨에서 항상 보이도록
+                v.titleVisibility = .visible
+                v.subtitleVisibility = .hidden
+                v.displayPriority = .required
+                v.layer.zPosition = 100
+
                 return v
 
             } else if let b = annotation as? BusAnnotation {
                 let v = mapView.dequeueReusableAnnotationView(withIdentifier: "bus", for: b) as! BusMarkerView
 
                 let isFollowed = (parent.vm.followBusId == b.id)
-                v.clusteringIdentifier = isFollowed ? "bus-\(b.id)" : "bus" // ✅ nil 금지
-                v.configureTint(isFollowed: isFollowed)
-                v.displayPriority = .required
-                v.layer.zPosition = 10
 
+                // ❗️nil 쓰지 말고, 팔로우 중이면 고유 ID로(클러스터에 안 빨려들게)
+                v.clusteringIdentifier = isFollowed ? "bus-\(b.id)" : "bus"
+
+                v.configureTint(isFollowed: isFollowed)
+
+                // ✅ 버스도 정류소와 '동급' 레벨
+                v.displayPriority = .required
+                v.layer.zPosition = 100
+
+                // 콜아웃 버튼(토글)
                 v.canShowCallout = true
                 let btn = UIButton(type: .system)
                 btn.setTitle(isFollowed ? "해제" : "추적", for: .normal)
                 btn.titleLabel?.font = .systemFont(ofSize: 14, weight: .semibold)
                 v.rightCalloutAccessoryView = btn
 
+                // 항상 보이는 말풍선(ETA/다음정류장) 업데이트
                 v.updateAlwaysOnBubble()
+
+                // ✅ 정류소와 겹치면 좌표는 그대로 두고 '뷰만' 살짝 비켜놓기
+                applyVisualDeconflictIfNearStop(mapView, view: v, bus: b)
+
                 return v
 
-            } else if annotation is MKClusterAnnotation {
-                return mapView.dequeueReusableAnnotationView(
+            } else if let cluster = annotation as? MKClusterAnnotation {
+                // 클러스터는 한 단계 낮게(동등 3요소와 겹치지 않도록)
+                let cv = mapView.dequeueReusableAnnotationView(
                     withIdentifier: MKMapViewDefaultClusterAnnotationViewReuseIdentifier,
-                    for: annotation
+                    for: cluster
                 )
+                cv.layer.zPosition = 80
+                return cv
             }
+
             return nil
         }
 
+        // ClusteredMapView.Coord
+        /// 정류소와 매우 가까울 때, '좌표'는 건드리지 않고 '뷰'만 살짝 비켜놓아 겹침을 피한다.
+        /// - 주의: centerOffset(포인트 단위)을 쓰므로 추적/계산/클러스터링에 영향 없음.
+        private func applyVisualDeconflictIfNearStop(_ mapView: MKMapView,
+                                                    view v: MKAnnotationView,
+                                                    bus: BusAnnotation) {
+            // 기본 오프셋(버스 마커의 원래 시각적 위치)
+            let defaultOffset = CGPoint(x: 0, y: -10)
+
+            // 맵에 현재 보이는 정류소들 스냅샷
+            let stopAnnos = mapView.annotations.compactMap { $0 as? BusStopAnnotation }
+            guard let nearest = stopAnnos.min(by: { lhs, rhs in
+                let dl = CLLocation(latitude: lhs.coordinate.latitude, longitude: lhs.coordinate.longitude)
+                    .distance(from: CLLocation(latitude: bus.coordinate.latitude, longitude: bus.coordinate.longitude))
+                let dr = CLLocation(latitude: rhs.coordinate.latitude, longitude: rhs.coordinate.longitude)
+                    .distance(from: CLLocation(latitude: bus.coordinate.latitude, longitude: bus.coordinate.longitude))
+                return dl < dr
+            }) else {
+                // 정류소가 없으면 기본값 유지
+                v.centerOffset = defaultOffset
+                return
+            }
+
+            // 버스-정류소 거리(m)
+            let dist = CLLocation(latitude: nearest.coordinate.latitude, longitude: nearest.coordinate.longitude)
+                .distance(from: CLLocation(latitude: bus.coordinate.latitude, longitude: bus.coordinate.longitude))
+
+            // 임계값(겹친다고 보기): 8m
+            let threshold: CLLocationDistance = 8.0
+            guard dist <= threshold else {
+                v.centerOffset = defaultOffset
+                return
+            }
+
+            // 가까우면 '뷰'를 살짝(포인트 기준) 비켜놓는다.
+            // 지도 스케일을 몰라도 시각적으로 충분한 미세 오프셋: 6pt 정도
+            // 정류소→버스 방향을 대략 반영하여 살짝 치우치게 표시
+            let dx = bus.coordinate.longitude - nearest.coordinate.longitude
+            let dy = bus.coordinate.latitude  - nearest.coordinate.latitude
+            let mag = max(1e-9, sqrt(dx*dx + dy*dy))
+            let ux = dx / mag
+            let uy = dy / mag
+
+            // 지도의 위쪽(-y)이 시각적으로 위로 올라가므로 y는 반대로 준다
+            let bump: CGFloat = 6.0
+            let px = CGFloat(ux) * bump
+            let py = CGFloat(-uy) * bump
+
+            v.centerOffset = CGPoint(x: defaultOffset.x + px, y: defaultOffset.y + py)
+        }
 
 
         // **탭 토글**: 같은 버스를 다시 누르면 해제, 해제 후 다시 누르면 재추적
