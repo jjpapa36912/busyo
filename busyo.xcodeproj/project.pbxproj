@@ -6,8 +6,16 @@
 	objectVersion = 77;
 	objects = {
 
+/* Begin PBXBuildFile section */
+		0A21CAEB2E7009B1006A8830 /* AdFitSDK in Frameworks */ = {isa = PBXBuildFile; productRef = 0A21CAEA2E7009B1006A8830 /* AdFitSDK */; };
+		513E57ED54830E7F31560E3F /* Pods_busyo.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 83033B8E1B27BDF31FB5DFBD /* Pods_busyo.framework */; };
+/* End PBXBuildFile section */
+
 /* Begin PBXFileReference section */
 		0A5A787E2E4B64C7004D148E /* busyo.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = busyo.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		83033B8E1B27BDF31FB5DFBD /* Pods_busyo.framework */ = {isa = PBXFileReference; explicitFileType = wrapper.framework; includeInIndex = 0; path = Pods_busyo.framework; sourceTree = BUILT_PRODUCTS_DIR; };
+		89096972878F4B9C42A9291F /* Pods-busyo.release.xcconfig */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.xcconfig; name = "Pods-busyo.release.xcconfig"; path = "Target Support Files/Pods-busyo/Pods-busyo.release.xcconfig"; sourceTree = "<group>"; };
+		F7FD66873CAE1B98D3F846C1 /* Pods-busyo.debug.xcconfig */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.xcconfig; name = "Pods-busyo.debug.xcconfig"; path = "Target Support Files/Pods-busyo/Pods-busyo.debug.xcconfig"; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
@@ -36,6 +44,8 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				0A21CAEB2E7009B1006A8830 /* AdFitSDK in Frameworks */,
+				513E57ED54830E7F31560E3F /* Pods_busyo.framework in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -47,6 +57,8 @@
 			children = (
 				0A5A78802E4B64C7004D148E /* busyo */,
 				0A5A787F2E4B64C7004D148E /* Products */,
+				63209105B9A7B81503362A7E /* Pods */,
+				D2C62DAEDE55D44FCF8FE3D3 /* Frameworks */,
 			);
 			sourceTree = "<group>";
 		};
@@ -58,6 +70,23 @@
 			name = Products;
 			sourceTree = "<group>";
 		};
+		63209105B9A7B81503362A7E /* Pods */ = {
+			isa = PBXGroup;
+			children = (
+				F7FD66873CAE1B98D3F846C1 /* Pods-busyo.debug.xcconfig */,
+				89096972878F4B9C42A9291F /* Pods-busyo.release.xcconfig */,
+			);
+			path = Pods;
+			sourceTree = "<group>";
+		};
+		D2C62DAEDE55D44FCF8FE3D3 /* Frameworks */ = {
+			isa = PBXGroup;
+			children = (
+				83033B8E1B27BDF31FB5DFBD /* Pods_busyo.framework */,
+			);
+			name = Frameworks;
+			sourceTree = "<group>";
+		};
 /* End PBXGroup section */
 
 /* Begin PBXNativeTarget section */
@@ -65,9 +94,12 @@
 			isa = PBXNativeTarget;
 			buildConfigurationList = 0A5A78892E4B64C9004D148E /* Build configuration list for PBXNativeTarget "busyo" */;
 			buildPhases = (
+				1C58261EBB5F0FDB5154E6C0 /* [CP] Check Pods Manifest.lock */,
 				0A5A787A2E4B64C7004D148E /* Sources */,
 				0A5A787B2E4B64C7004D148E /* Frameworks */,
 				0A5A787C2E4B64C7004D148E /* Resources */,
+				0A21CABE2E6F2106006A8830 /* ShellScript */,
+				AE8F069569F83C152B4DD0A7 /* [CP] Copy Pods Resources */,
 			);
 			buildRules = (
 			);
@@ -77,8 +109,6 @@
 				0A5A78802E4B64C7004D148E /* busyo */,
 			);
 			name = busyo;
-			packageProductDependencies = (
-			);
 			productName = busyo;
 			productReference = 0A5A787E2E4B64C7004D148E /* busyo.app */;
 			productType = "com.apple.product-type.application";
@@ -107,6 +137,9 @@
 			);
 			mainGroup = 0A5A78752E4B64C7004D148E;
 			minimizedProjectReferenceProxies = 1;
+			packageReferences = (
+				0A21CAE92E7009B1006A8830 /* XCRemoteSwiftPackageReference "adfit-spm" */,
+			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = 0A5A787F2E4B64C7004D148E /* Products */;
 			projectDirPath = "";
@@ -126,6 +159,69 @@
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 /* End PBXResourcesBuildPhase section */
+
+/* Begin PBXShellScriptBuildPhase section */
+		0A21CABE2E6F2106006A8830 /* ShellScript */ = {
+			isa = PBXShellScriptBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+			);
+			inputPaths = (
+			);
+			outputFileListPaths = (
+			);
+			outputPaths = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "#!/bin/sh\nset -e\n\nFRAMEWORKS_DIR=\"${TARGET_BUILD_DIR}/${FRAMEWORKS_FOLDER_PATH}\"\n\nif [ -d \"${FRAMEWORKS_DIR}\" ]; then\n  /usr/bin/find \"${FRAMEWORKS_DIR}\" -name \"*.framework\" -type d -print0 | while IFS= read -r -d '' fw; do\n    bin=\"${fw}/$(basename -s .framework \"$fw\")\"\n    if [ -f \"$bin\" ]; then\n      # Bitcode 제거 (제출용)\n      if /usr/bin/xcrun bitcode_strip -r \"$bin\" -o \"$bin\" 2>/dev/null; then\n        echo \"Stripped bitcode from $(basename \"$fw\")\"\n      else\n        echo \"Skip (no bitcode): $(basename \"$fw\")\"\n      fi\n    fi\n  done\nelse\n  echo \"No embedded frameworks to process at ${FRAMEWORKS_DIR}\"\nfi\n";
+		};
+		1C58261EBB5F0FDB5154E6C0 /* [CP] Check Pods Manifest.lock */ = {
+			isa = PBXShellScriptBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+			);
+			inputPaths = (
+				"${PODS_PODFILE_DIR_PATH}/Podfile.lock",
+				"${PODS_ROOT}/Manifest.lock",
+			);
+			name = "[CP] Check Pods Manifest.lock";
+			outputFileListPaths = (
+			);
+			outputPaths = (
+				"$(DERIVED_FILE_DIR)/Pods-busyo-checkManifestLockResult.txt",
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "diff \"${PODS_PODFILE_DIR_PATH}/Podfile.lock\" \"${PODS_ROOT}/Manifest.lock\" > /dev/null\nif [ $? != 0 ] ; then\n    # print error to STDERR\n    echo \"error: The sandbox is not in sync with the Podfile.lock. Run 'pod install' or update your CocoaPods installation.\" >&2\n    exit 1\nfi\n# This output is used by Xcode 'outputs' to avoid re-running this script phase.\necho \"SUCCESS\" > \"${SCRIPT_OUTPUT_FILE_0}\"\n";
+			showEnvVarsInLog = 0;
+		};
+		AE8F069569F83C152B4DD0A7 /* [CP] Copy Pods Resources */ = {
+			isa = PBXShellScriptBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+				"${PODS_ROOT}/Target Support Files/Pods-busyo/Pods-busyo-resources-${CONFIGURATION}-input-files.xcfilelist",
+			);
+			inputPaths = (
+			);
+			name = "[CP] Copy Pods Resources";
+			outputFileListPaths = (
+				"${PODS_ROOT}/Target Support Files/Pods-busyo/Pods-busyo-resources-${CONFIGURATION}-output-files.xcfilelist",
+			);
+			outputPaths = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "\"${PODS_ROOT}/Target Support Files/Pods-busyo/Pods-busyo-resources.sh\"\n";
+			showEnvVarsInLog = 0;
+		};
+/* End PBXShellScriptBuildPhase section */
 
 /* Begin PBXSourcesBuildPhase section */
 		0A5A787A2E4B64C7004D148E /* Sources */ = {
@@ -176,7 +272,7 @@
 				DEVELOPMENT_TEAM = 9KDUS59PR5;
 				ENABLE_STRICT_OBJC_MSGSEND = YES;
 				ENABLE_TESTABILITY = YES;
-				ENABLE_USER_SCRIPT_SANDBOXING = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = NO;
 				GCC_C_LANGUAGE_STANDARD = gnu17;
 				GCC_DYNAMIC_NO_PIC = NO;
 				GCC_NO_COMMON_BLOCKS = YES;
@@ -240,7 +336,7 @@
 				DEVELOPMENT_TEAM = 9KDUS59PR5;
 				ENABLE_NS_ASSERTIONS = NO;
 				ENABLE_STRICT_OBJC_MSGSEND = YES;
-				ENABLE_USER_SCRIPT_SANDBOXING = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = NO;
 				GCC_C_LANGUAGE_STANDARD = gnu17;
 				GCC_NO_COMMON_BLOCKS = YES;
 				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
@@ -261,12 +357,13 @@
 		};
 		0A5A788A2E4B64C9004D148E /* Debug */ = {
 			isa = XCBuildConfiguration;
+			baseConfigurationReference = F7FD66873CAE1B98D3F846C1 /* Pods-busyo.debug.xcconfig */;
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				ASSETCATALOG_COMPILER_INCLUDE_ALL_APPICON_ASSETS = NO;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 3;
+				CURRENT_PROJECT_VERSION = 6;
 				DEVELOPMENT_TEAM = 9KDUS59PR5;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
@@ -283,7 +380,7 @@
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				MARKETING_VERSION = 1.2;
+				MARKETING_VERSION = 1.5;
 				PRODUCT_BUNDLE_IDENTIFIER = com.jjpapa.busyo;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SWIFT_EMIT_LOC_STRINGS = YES;
@@ -294,12 +391,13 @@
 		};
 		0A5A788B2E4B64C9004D148E /* Release */ = {
 			isa = XCBuildConfiguration;
+			baseConfigurationReference = 89096972878F4B9C42A9291F /* Pods-busyo.release.xcconfig */;
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				ASSETCATALOG_COMPILER_INCLUDE_ALL_APPICON_ASSETS = NO;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 3;
+				CURRENT_PROJECT_VERSION = 6;
 				DEVELOPMENT_TEAM = 9KDUS59PR5;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
@@ -316,7 +414,7 @@
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				MARKETING_VERSION = 1.2;
+				MARKETING_VERSION = 1.5;
 				PRODUCT_BUNDLE_IDENTIFIER = com.jjpapa.busyo;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SWIFT_EMIT_LOC_STRINGS = YES;
@@ -347,6 +445,25 @@
 			defaultConfigurationName = Release;
 		};
 /* End XCConfigurationList section */
+
+/* Begin XCRemoteSwiftPackageReference section */
+		0A21CAE92E7009B1006A8830 /* XCRemoteSwiftPackageReference "adfit-spm" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/adfit/adfit-spm.git";
+			requirement = {
+				kind = upToNextMajorVersion;
+				minimumVersion = 3.19.9;
+			};
+		};
+/* End XCRemoteSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		0A21CAEA2E7009B1006A8830 /* AdFitSDK */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 0A21CAE92E7009B1006A8830 /* XCRemoteSwiftPackageReference "adfit-spm" */;
+			productName = AdFitSDK;
+		};
+/* End XCSwiftPackageProductDependency section */
 	};
 	rootObject = 0A5A78762E4B64C7004D148E /* Project object */;
 }

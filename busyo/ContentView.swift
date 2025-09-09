@@ -14,11 +14,15 @@ import MapKit
 import CoreLocation
 import Foundation
 import simd
+import GoogleMobileAds
 
 
 // MARK: - App
 @main
 struct BusyoApp: App {
+//    init() {
+//        GADMobileAds.sharedInstance().start(completionHandler: nil)
+//        }
     var body: some Scene { WindowGroup { BusMapScreen() } }
 }
 
@@ -1758,7 +1762,13 @@ struct ClusteredMapView: UIViewRepresentable {
         let map = MKMapView(frame: .zero)
         map.delegate = context.coordinator
         map.showsUserLocation = true
-        map.region = .init(center: .init(latitude: 36.351, longitude: 127.385),
+
+        // ✅ 내 위치 가능하면 그걸로 시작, 아니면 대전 기본값
+        let lm = CLLocationManager()
+        let startCenter: CLLocationCoordinate2D =
+            lm.location?.coordinate ?? CLLocationCoordinate2D(latitude: 36.351, longitude: 127.385)
+
+        map.region = .init(center: startCenter,
                            span: .init(latitudeDelta: 0.045, longitudeDelta: 0.045))
         map.pointOfInterestFilter = .includingAll
         map.register(MKMarkerAnnotationView.self, forAnnotationViewWithReuseIdentifier: "stop")
@@ -1766,6 +1776,7 @@ struct ClusteredMapView: UIViewRepresentable {
         map.register(ClusterView.self, forAnnotationViewWithReuseIdentifier: MKMapViewDefaultClusterAnnotationViewReuseIdentifier)
         return map
     }
+
 
     func updateUIView(_ uiView: MKMapView, context: Context) {
         // 내 위치 버튼 처리
@@ -2195,7 +2206,11 @@ struct BusMapScreen: View {
     @StateObject private var vm = MapVM()
     @StateObject private var loc = LocationAuth()
     @State private var recenterRequest = false
-
+    
+    @State private var showBanner = false     // 노출 여부
+    @State private var debugText = ""
+        @State private var bannerMounted = false
+        @StateObject private var banner = BannerAdController()
     var body: some View {
         ZStack {
             ClusteredMapView(vm: vm, recenterRequest: $recenterRequest)
@@ -2228,6 +2243,39 @@ struct BusMapScreen: View {
                 .padding(.leading, 8)
                 .padding(.trailing, 8)
         }
+        // ✅ 상단 배너 (노치/상단바와 겹치지 않음)
+        // 🔽 레이아웃에 영향 주지 않는 오버레이로 하단에 배너 고정
+        .safeAreaInset(edge: .top)  {
+                AdFitVerboseBannerView(
+                    clientId: "DAN-0pxnvDh8ytVm0EsZ",
+                    adUnitSize: "320x50",
+                    timeoutSec: 8,
+                    maxRetries: 2
+                ) { event in
+                    switch event {
+                    case .begin(let n):  debugText = "BEGIN \(n)"
+                    case .willLoad:      debugText = "WILL_LOAD"
+                    case .success(let ms):
+                        showBanner = true          // ✅ 성공 시 보이기
+                        debugText = "SUCCESS \(ms)ms"
+                    case .fail(let err, let n):
+                        showBanner = false         // 실패 시 숨기기
+                        debugText = "FAIL(\(n)): \(err.localizedDescription)"
+                    case .timeout(let sec, let n):
+                        showBanner = false
+                        debugText = "TIMEOUT \(sec)s (attempt \(n))"
+                    case .retryScheduled(let after, let next):
+                        debugText = "RETRY in \(after)s → \(next)"
+                    case .disposed:
+                        debugText = "disposed"
+                    }
+                }
+                .frame(width: 320, height: 50)     // 뷰 자체는 실제 크기 유지
+                .opacity(showBanner ? 1 : 0)       // 🔸 화면에서는 숨김/표시만 제어
+                .allowsHitTesting(showBanner)
+                .padding(.bottom, 8)
+                .animation(.easeInOut(duration: 0.2), value: showBanner)
+                }
     }
 }
 /// JSON에서 item이 단일 객체이든 배열이든 모두 수용
