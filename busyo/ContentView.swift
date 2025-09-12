@@ -484,6 +484,7 @@ final class BusAPI: NSObject, URLSessionDelegate {
 final class BusStopAnnotation: NSObject, MKAnnotation {
     let stop: BusStop
     @objc dynamic var coordinate: CLLocationCoordinate2D
+    
     var title: String? { stop.name }
     init(_ s: BusStop) { self.stop = s; self.coordinate = .init(latitude: s.lat, longitude: s.lon) }
 }
@@ -542,6 +543,24 @@ final class BusAnnotation: NSObject, MKAnnotation {
         self.coordinate = newC
         CATransaction.commit()
     }
+    
+    // BusAnnotation.swift
+
+    @MainActor func update(to b: BusLive, vm: MapVM) {
+        self.nextStopName = b.nextStopName
+        self.etaMinutes   = b.etaMinutes
+        setSubtitle(Self.makeSubtitle(eta: b.etaMinutes, next: b.nextStopName))
+
+        let newC = CLLocationCoordinate2D(latitude: b.lat, longitude: b.lon)
+        CATransaction.begin()
+        CATransaction.setAnimationDuration(0.9)
+        self.coordinate = newC
+        CATransaction.commit()
+
+        // ✅ VM에 다음 정류장 업데이트
+        vm.updateHighlightStop(for: b)
+    }
+
 }
 
 // 기존 BusMarkerView 전체 교체
@@ -655,7 +674,7 @@ final class ClusterView: MKAnnotationView {
 }
 
 // MARK: - Tracking helpers
-private struct BusTrack {
+struct BusTrack {
     var prevLoc: CLLocationCoordinate2D?
     var prevAt: Date?
     var lastLoc: CLLocationCoordinate2D
@@ -783,6 +802,296 @@ final class MapVM: ObservableObject {
     // ✅ epoch 게이팅
        private var epochCounter: UInt64 = 0
        private var latestAppliedEpoch: UInt64 = 0
+    // MapVM.swift
+
+    // MapVM.swift (클래스 맨 위 @Published 모음 근처)
+    // MapVM 내부에 추가
+
+    @Published var futureRouteCoords: [CLLocationCoordinate2D] = []   // ▶ 미래(앞으로 갈) 경로
+    @Published var highlightedStopId: String?                         // ▶ 노란 하이라이트 정류장
+
+    // MapVM 안 (프로퍼티들 근처)
+    @Published var futureRouteVersion: Int = 0
+    
+    // 현재 좌표와 (가능하면) 추정 진행방향으로 임시 빨간선(직선) 그리기
+    func setTemporaryFutureRouteFromBus(busId: String, coordinate: CLLocationCoordinate2D, meters: Double = 1200) {
+        // tracks는 MapVM 내부에 private이지만, 여기선 접근 가능
+        let tr = tracks[busId]
+        setTemporaryFutureRoute(from: coordinate, using: tr, meters: meters)
+    }
+
+    // routeNo -> routeId 공개 래퍼 (내부용)
+    func routeId(forRouteNo routeNo: String) -> String? {
+        return resolveRouteId(for: routeNo)   // 원래 private인 함수에 얇은 포장
+    }
+
+    
+    
+    // MapVM 안에 추가
+    // MapVM 안에 이미 만든 ensureAndDrawFutureRouteNow 를 아래로 교체
+    func ensureAndDrawFutureRouteNow(for busId: String, routeNo: String, coord: CLLocationCoordinate2D) async {
+        // 0) routeId 확보
+        guard let rid = resolveRouteId(for: routeNo) else {
+            print("⚠️ futureRoute: routeId not resolved for \(routeNo)")
+            DispatchQueue.main.async { self.clearFutureRoute() }
+            return
+        }
+
+        // 1) 메타 보장 (await)
+        await ensureRouteMeta(routeId: rid)
+
+        // 2) 캐시에서 메타 꺼내기
+        guard var meta = routeMetaById[rid] else {
+            print("⚠️ futureRoute: meta missing for rid=\(rid)")
+            DispatchQueue.main.async { self.clearFutureRoute() }
+            return
+        }
+
+        // 3) 무결성 보정: 길이 불일치면 즉시 재계산
+        if meta.cumul.count != meta.shape.count {
+            print("⚠️ futureRoute: cumul len \(meta.cumul.count) != shape len \(meta.shape.count) → rebuild")
+            let rebuilt = buildCumul(meta.shape)
+            meta = RouteMeta(shape: meta.shape,
+                             cumul: rebuilt,
+                             stopIds: meta.stopIds,
+                             stopCoords: meta.stopCoords,
+                             stopS: meta.stopS)
+            routeMetaById[rid] = meta
+        }
+        print("🔎 meta check: shape=\(meta.shape.count) cumul=\(meta.cumul.count)")
+
+        // 4) shape 검증 (2점 미만이면 폴백 불가)
+        guard meta.shape.count >= 2 else {
+            print("⚠️ futureRoute: shape too short (\(meta.shape.count)) → clear")
+            DispatchQueue.main.async { self.clearFutureRoute() }
+            return
+        }
+        print("🔎 meta check: shape=\(meta.shape.count) cumul=\(meta.cumul.count)")
+
+        // 5) 사영 시도
+        if let prj = projectOnRoute(coord, shape: meta.shape, cumul: meta.cumul) {
+            setFutureRoute(shape: meta.shape, fromSeg: prj.seg, fromPoint: prj.snapped)
+            print("✅ futureRoute: set \(futureRouteCoords.count) pts (seg=\(prj.seg))")
+        } else {
+            // 6) 스냅 실패 → 'shape 전체'로 폴백(빨간 선이라도 보이게)
+            print("⚠️ futureRoute: projectOnRoute failed → fallback to full shape")
+            DispatchQueue.main.async {
+                self.futureRouteCoords = meta.shape
+                self.futureRouteVersion &+= 1
+            }
+        }
+    }
+
+
+    func clearFutureRoute() {
+        futureRouteCoords.removeAll()
+        futureRouteVersion &+= 1
+    }
+
+    /// 현재 사영 위치(prj.snapped)에서부터 노선 끝까지 라인 구성
+    private func setFutureRoute(shape: [CLLocationCoordinate2D],
+                                fromSeg seg: Int,
+                                fromPoint snapped: CLLocationCoordinate2D) {
+        guard !shape.isEmpty else { return }
+
+        var coords: [CLLocationCoordinate2D] = []
+        coords.append(snapped)
+
+        // seg 이후의 shape 포인트들을 이어붙임
+        let start = max( seg + 1, 0 )
+        if start < shape.count {
+            coords.append(contentsOf: shape[start..<shape.count])
+        }
+
+        // 너무 짧으면 무시
+        if coords.count < 2 { futureRouteCoords = []; futureRouteVersion &+= 1; return }
+
+        futureRouteCoords = coords
+        futureRouteVersion &+= 1
+    }
+
+    // MapVM 안에 넣기(기존 setFutureRoute / updateFutureRouteIfFollowed 를 대체)
+
+    // prj.s(현재 진행 s)에서부터 stopS[nextIdx], stopS[nextIdx+1] ... 순서로
+    // meta.shape의 포인트들을 잘라 붙이며 경로를 만든다.
+    private func buildFutureRouteStopToStop(meta: RouteMeta,
+                                            prj: (snapped: CLLocationCoordinate2D, s: Double, seg: Int, lateral: Double),
+                                            nextIdx: Int) -> [CLLocationCoordinate2D] {
+        guard !meta.shape.isEmpty, meta.shape.count == meta.cumul.count,
+              !meta.stopS.isEmpty, meta.stopS.count == meta.stopIds.count else { return [] }
+
+        var coords: [CLLocationCoordinate2D] = []
+        coords.append(prj.snapped)                 // 시작: 현재 사영점
+        var curS = prj.s                           // 현재 누적 s의 기준점
+        var startSeg = prj.seg                     // 다음 shape 포인트 시작 인덱스
+
+        // 구간별로: (curS -> stopS[i]) 까지 shape 포인트를 붙이고, 마지막에 정류장 좌표를 추가
+        for i in nextIdx ..< meta.stopS.count {
+            let targetS = meta.stopS[i]
+            if targetS <= curS { continue }        // 방어적
+
+            // shape에서 curS 이후 ~ targetS 이하인 포인트만 추가
+            // seg 힌트를 가진 상태라 비용 적음
+            var j = max(0, startSeg + 1)
+            while j < meta.cumul.count && meta.cumul[j] <= targetS {
+                if meta.cumul[j] > curS { coords.append(meta.shape[j]) }
+                j += 1
+            }
+
+            // 마지막에 "정류장 좌표"를 꼭 찍어 준다(시각적으로 직관적)
+            coords.append(meta.stopCoords[i])
+
+            // 다음 루프를 위해 기준 갱신
+            curS = targetS
+            startSeg = max(startSeg, j - 1)
+        }
+
+        // 너무 짧으면 무시
+        return coords.count >= 2 ? coords : []
+    }
+
+    // 팔로우 중일 때만 VM state에 반영
+    private func updateFutureRouteIfFollowed(busId: String,
+                                             meta: RouteMeta,
+                                             prj: (snapped: CLLocationCoordinate2D, s: Double, seg: Int, lateral: Double),
+                                             nextIdx: Int) {
+        guard followBusId == busId else { return }
+        let coords = buildFutureRouteStopToStop(meta: meta, prj: prj, nextIdx: nextIdx)
+        futureRouteCoords = coords
+        futureRouteVersion &+= 1
+    }
+
+    // 탭 직후 즉시 그릴 때(메타가 이미 있을 때)
+    func trySetFutureRouteImmediately(for bus: BusAnnotation) {
+        guard let rid = resolveRouteId(for: bus.routeNo),
+              let meta = routeMetaById[rid],
+              let prj = projectOnRoute(bus.coordinate, shape: meta.shape, cumul: meta.cumul)
+        else { return }
+
+        // 현재 s 이후 "다가올" 첫 정류장 인덱스 계산
+        let nextIdx = meta.stopS.firstIndex(where: { $0 > prj.s + 0.5 }) ?? (meta.stopS.count - 1)
+        let coords = buildFutureRouteStopToStop(meta: meta, prj: prj, nextIdx: nextIdx)
+        futureRouteCoords = coords
+        futureRouteVersion &+= 1
+    }
+
+    
+    
+    
+    
+    // MapVM.swift 안
+    private func buildFutureRoute(meta: RouteMeta,
+                                  prj: (snapped: CLLocationCoordinate2D, s: Double, seg: Int, lateral: Double)
+    ) -> [CLLocationCoordinate2D] {
+        // 현재 스냅된 지점부터 다음 버텍스 ~ 종점까지 이어붙이기
+        var coords: [CLLocationCoordinate2D] = [prj.snapped]
+        let start = min(prj.seg + 1, meta.shape.count)   // 다음 버텍스부터
+        if start < meta.shape.count {
+            coords.append(contentsOf: meta.shape[start...])
+        }
+        return coords
+    }
+
+    /// 외부에서 지울 때 사용
+  
+
+    
+    // MapVM 안 (private 메서드 섹션)
+    private func setFutureRoute(from segIndex: Int,
+                                snapped: CLLocationCoordinate2D,
+                                meta: RouteMeta) {
+        var coords: [CLLocationCoordinate2D] = [snapped]
+        let i = max(0, min(segIndex + 1, meta.shape.count))   // 현 위치 이후부터
+        if i < meta.shape.count {
+            coords.append(contentsOf: meta.shape[i...])
+        }
+        // 너무 가까운 중복점 제거(옵션)
+        if coords.count >= 2 {
+            var cleaned: [CLLocationCoordinate2D] = [coords[0]]
+            for c in coords.dropFirst() {
+                let d = CLLocation(latitude: cleaned.last!.latitude, longitude: cleaned.last!.longitude)
+                    .distance(from: CLLocation(latitude: c.latitude, longitude: c.longitude))
+                if d >= 2 { cleaned.append(c) }
+            }
+            futureRouteCoords = cleaned
+        } else {
+            futureRouteCoords = coords
+        }
+        futureRouteVersion &+= 1
+    }
+    // MapVM 안
+    func highlightedBusStop() -> BusStop? {
+        guard let sid = highlightedStopId,
+              let fid = followBusId,
+              let rno = routeNoById[fid],
+              let rid = resolveRouteId(for: rno),
+              let arr = routeStopsByRouteId[rid] else { return nil }
+        return arr.first { $0.id == sid }
+    }
+
+    /// 현재(사영점)에서 노선 shape의 끝까지를 빨간 선으로 쓰기 위한 좌표 배열을 만든다.
+    func updateFutureRoute(
+        for busId: String,
+        prj: (snapped: CLLocationCoordinate2D, s: Double, seg: Int, lateral: Double),
+        meta: RouteMeta
+    ) {
+        var coords: [CLLocationCoordinate2D] = []
+        coords.append(prj.snapped) // 현재 위치(경로 위 사영점) 포함
+
+        if prj.seg + 1 < meta.shape.count {
+            coords.append(contentsOf: meta.shape[(prj.seg + 1)...])
+        }
+
+        // 메인스레드 반영
+        DispatchQueue.main.async { [weak self] in
+            self?.futureRouteCoords = coords
+        }
+    }
+
+
+    func updateHighlightStop(for bus: BusLive) {
+        highlightedStopId = bus.nextStopName != nil
+            ? stops.first(where: { $0.name == bus.nextStopName })?.id
+            : nil
+    }
+
+    // MapVM 내부에 추가
+    // MapVM
+    func futureRoutePolyline(for busId: String) -> MKPolyline? {
+        guard let live = buses.first(where: { $0.id == busId }) else { return nil }
+        let here = CLLocationCoordinate2D(latitude: live.lat, longitude: live.lon)
+
+        let routeNo = routeNoById[busId] ?? live.routeNo
+        guard let routeId = resolveRouteId(for: routeNo),
+              let meta = routeMetaById[routeId],
+              meta.shape.count >= 2,
+              meta.shape.count == meta.cumul.count else {
+            return nil
+        }
+
+        if let prj = projectOnRoute(here, shape: meta.shape, cumul: meta.cumul) {
+            var coords: [CLLocationCoordinate2D] = []
+            coords.append(prj.snapped)
+            let nextIdx = max(0, min(prj.seg + 1, meta.shape.count - 1))
+            coords.append(contentsOf: meta.shape[nextIdx...])
+            let line = MKPolyline(coordinates: coords, count: coords.count)
+            line.title = "busFuture"
+            return line
+        } else {
+            let line = MKPolyline(coordinates: meta.shape, count: meta.shape.count)
+            line.title = "busFuture"
+            return line
+        }
+    }
+
+
+    let trail = BusTrailStore()
+        @Published var trailVersion: Int = 0      // 오버레이 갱신 트리거
+
+        func startTrail(for busId: String, seed: CLLocationCoordinate2D?) {
+            trail.start(id: busId, seed: seed); trailVersion &+= 1
+        }
+        func stopTrail() { trail.stop(); trailVersion &+= 1 }
     // MapVM 안에 추가
     /// ETA(분)과 다음 정류장 s_stop을 이용해 s_eta 관측치와 분산 R을 만든다.
     private func etaToSObservation(nextStopS: Double, etaMinutes: Int, vPrior: Double) -> (z: Double, R: Double) {
@@ -985,12 +1294,51 @@ final class MapVM: ObservableObject {
             return .infinity
         }
     }
+    // MapVM 안에 추가: 폴백(임시) 미래 경로 — 현 위치에서 진행방향으로 N미터를 직선으로 그려줌
+    func setTemporaryFutureRoute(from coord: CLLocationCoordinate2D, using track: BusTrack?, meters: Double = 1200) {
+        var coords: [CLLocationCoordinate2D] = [coord]
+        if let tr = track, let dir = tr.dirUnit {
+            let mLat = GeoUtil.metersPerDegLat(at: coord.latitude)
+            let mLon = GeoUtil.metersPerDegLon(at: coord.latitude)
+            let dLat = (meters * dir.y) / mLat
+            let dLon = (meters * dir.x) / mLon
+            let p2 = CLLocationCoordinate2D(latitude: coord.latitude + dLat, longitude: coord.longitude + dLon)
+            coords.append(p2)
+        } else {
+            // 방향 없으면 화면 위쪽으로라도 짧게
+            let mLat = GeoUtil.metersPerDegLat(at: coord.latitude)
+            let p2 = CLLocationCoordinate2D(latitude: coord.latitude + (meters / mLat), longitude: coord.longitude)
+            coords.append(p2)
+        }
+        DispatchQueue.main.async { [weak self] in
+            self?.futureRouteCoords = coords
+            self?.futureRouteVersion &+= 1
+        }
+    }
 
-    // MapVM 안의 기존 ensureRouteMeta(routeId:) 교체
+    // MapVM 안에 추가: 메타 재시도(지수 백오프)
+    func ensureRouteMetaWithRetry(routeId: String, maxAttempts: Int = 5) {
+        Task { [weak self] in
+            guard let self else { return }
+            for attempt in 1...maxAttempts {
+                await self.ensureRouteMeta(routeId: routeId)
+                if let meta = self.routeMetaById[routeId], meta.shape.count >= 2 { break }
+                let backoff = UInt64(min( pow(2.0, Double(attempt-1)) * 0.8, 8.0 ) * 1_000_000_000)
+                try? await Task.sleep(nanoseconds: backoff)
+            }
+        }
+    }
+
+    // MapVM 안의 ensureRouteMeta(routeId:) 를 아래처럼 일부 보완
+    // MapVM 안의 ensureRouteMeta(routeId:) 교체
     private func ensureRouteMeta(routeId: String) async {
-        if routeMetaById[routeId] != nil { return }
+        // 이미 정상 메타 있으면 스킵
+        if let m = routeMetaById[routeId], m.shape.count >= 2, m.shape.count == m.cumul.count {
+            return
+        }
 
         do {
+            // 1) 정류장 목록 확보(캐시 우선)
             let stops: [BusStop]
             if let cached = routeStopsByRouteId[routeId] {
                 stops = cached
@@ -1000,15 +1348,43 @@ final class MapVM: ObservableObject {
                 stops = fetched
             }
 
-            let shape = try await api.fetchRoutePath(cityCode: CITY_CODE, routeId: routeId)
+            // 2) 경로 점열 시도
+            var shape: [CLLocationCoordinate2D] = []
+            do {
+                shape = try await api.fetchRoutePath(cityCode: CITY_CODE, routeId: routeId)
+            } catch {
+                // 국토부 500 등 예외는 폴백으로 처리
+                print("⚠️ RoutePath fetch error for \(routeId): \(error)")
+                shape = []
+            }
+
+            // 3) 폴백: RoutePath가 빈 경우, 정류장 좌표를 '순서대로' 연결해서 shape 구성
+            if shape.count < 2 {
+                if stops.count >= 2 {
+                    shape = stops.map { CLLocationCoordinate2D(latitude: $0.lat, longitude: $0.lon) }
+                    print("ℹ️ ensureRouteMeta: fallback shapeFromStops count=\(shape.count) for \(routeId)")
+                } else {
+                    print("⚠️ ensureRouteMeta: shape too short (\(shape.count)) and stops too few (\(stops.count)) for \(routeId)")
+                    return
+                }
+            }
+
+            // 4) 누적거리 재계산 및 무결성 체크
             let cumul = buildCumul(shape)
+            guard cumul.count == shape.count else {
+                print("⚠️ ensureRouteMeta: cumul mismatch \(cumul.count) vs \(shape.count) for \(routeId)")
+                return
+            }
+
+            // 5) 정류장 s 좌표 계산
             let stopS = stopsProjectedS(stops, shape: shape, cumul: cumul)
 
+            // 6) 캐시에 저장
             routeMetaById[routeId] = RouteMeta(
                 shape: shape,
                 cumul: cumul,
                 stopIds: stops.map { $0.id },
-                stopCoords: stops.map { .init(latitude: $0.lat, longitude: $0.lon) },
+                stopCoords: stops.map { CLLocationCoordinate2D(latitude: $0.lat, longitude: $0.lon) },
                 stopS: stopS
             )
         } catch {
@@ -1579,11 +1955,11 @@ final class MapVM: ObservableObject {
         var out: [BusLive] = []
 
         // 튜닝 파라미터
-        let LATERAL_MAX_M: Double = 60        // 경로에서 60m 이상 벗어나면 관측 폐기
-        let PASS_GATE_M: Double   = 18        // 정류장 게이트(지남) 판정
-        let SPEED_FLOOR_MPS: Double = 1.5     // ETA 계산 바닥 속도
-        let NEAR_STOP_M: Double   = 25        // 정류장 근접시 ETA=0
-        let MAX_STEP_M: Double    = 300       // 점프 제거
+        let LATERAL_MAX_M: Double = 60
+        let PASS_GATE_M: Double   = 18
+        let SPEED_FLOOR_MPS: Double = 1.5
+        let NEAR_STOP_M: Double   = 25
+        let MAX_STEP_M: Double    = 300
         let EMA_ALPHA: Double     = 0.35
         let MAX_PLAUSIBLE_MPS: Double = 40.0
         let FOLLOW_STEP_ALLOW_METERS: CLLocationDistance = 1200
@@ -1593,7 +1969,7 @@ final class MapVM: ObservableObject {
             let rawC = CLLocationCoordinate2D(latitude: b.lat, longitude: b.lon)
             let isFollowed = (followBusId == b.id)
 
-            // 1) 트랙/EMA 준비
+            // 1) 트랙 준비
             if tracks[b.id] == nil {
                 tracks[b.id] = BusTrack(prevLoc: nil, prevAt: nil, lastLoc: rawC, lastAt: now)
                 out.append(b)
@@ -1601,7 +1977,7 @@ final class MapVM: ObservableObject {
             }
             var tr = tracks[b.id]!
 
-            // 2) 점프/EMA 평활
+            // 2) 점프/EMA
             let step = CLLocation(latitude: tr.lastLoc.latitude, longitude: tr.lastLoc.longitude)
                 .distance(from: CLLocation(latitude: rawC.latitude, longitude: rawC.longitude))
             let dt = max(0.01, now.timeIntervalSince(tr.lastAt))
@@ -1613,7 +1989,6 @@ final class MapVM: ObservableObject {
                 else if instMps <= MAX_PLAUSIBLE_MPS { acceptAsJump = true }
             }
             if step > MAX_STEP_M && !acceptAsJump {
-                // 너무 멀리 튐 → 이 틱은 버리고 이전 상태 유지
                 out.append(b); continue
             }
 
@@ -1629,35 +2004,44 @@ final class MapVM: ObservableObject {
             tr.updateKinematics()
             tracks[b.id] = tr
 
-            // 3) 노선 메타 확보 & 맵매칭(온루트 강제)
+            // 3) 메타/사영
             guard let rid = resolveRouteId(for: b.routeNo),
                   let meta = snap.metaById[rid],
                   let rStops = snap.stopsByRouteId[rid],
                   let prj = projectOnRoute(smooth, shape: meta.shape, cumul: meta.cumul)
             else {
-                // 메타 없으면 일단 coast 예측으로 유지
-                b.lat = tr.coastPredict(at: now.addingTimeInterval(0.6),
-                                        decay: COAST_DECAY_PER_SEC, minSpeed: COAST_MIN_SPEED).latitude
-                b.lon = tr.coastPredict(at: now.addingTimeInterval(0.6),
-                                        decay: COAST_DECAY_PER_SEC, minSpeed: COAST_MIN_SPEED).longitude
+                // 메타 없음 → coast
+                let pred = tr.coastPredict(at: now.addingTimeInterval(0.6),
+                                           decay: COAST_DECAY_PER_SEC, minSpeed: COAST_MIN_SPEED)
+                b.lat = pred.latitude
+                b.lon = pred.longitude
                 if let prev = lastETAMinByBusId[b.id] { b.etaMinutes = prev }
+
+                // 트레일만 기록
+                if followBusId == b.id {
+                    let c = CLLocationCoordinate2D(latitude: b.lat, longitude: b.lon)
+                    trail.appendIfNeeded(c); trailVersion &+= 1
+                }
                 out.append(b)
                 continue
             }
 
-            // 오프로드 게이팅: 경로에서 너무 멀면 관측 무시(아이콘 튐 방지)
+            // 오프루트 → 무시
             if prj.lateral > LATERAL_MAX_M {
-                // 이전 추정 유지 + ETA 유지
                 if let prev = lastETAMinByBusId[b.id] { b.etaMinutes = prev }
+                if followBusId == b.id {
+                    let c = CLLocationCoordinate2D(latitude: b.lat, longitude: b.lon)
+                    trail.appendIfNeeded(c); trailVersion &+= 1
+                }
                 out.append(b)
                 continue
             }
 
-            // “지도 좌표”는 반드시 경로 위(clamping)
+            // 경로 위로 클램프
             b.lat = prj.snapped.latitude
             b.lon = prj.snapped.longitude
 
-            // 4) 정류장 통과/다음 정류장 결정(단조 증가)
+            // 4) 다음 정류장 인덱스
             let stopS = meta.stopS
             let count = min(stopS.count, rStops.count)
             guard count > 0 else { out.append(b); continue }
@@ -1666,7 +2050,6 @@ final class MapVM: ObservableObject {
             while passed + 1 < count && (prj.s - stopS[passed + 1]) >= PASS_GATE_M {
                 passed += 1
             }
-            // 뒤로 후퇴 금지
             if let last = lastPassedStopIndex[b.id] { passed = max(passed, last) }
             lastPassedStopIndex[b.id] = passed
 
@@ -1674,7 +2057,7 @@ final class MapVM: ObservableObject {
             let nextStop = rStops[nextIdx]
             b.nextStopName = nextStop.name
 
-            // 5) ETA 계산(잔여거리/속도, 근접시 0분)
+            // 5) ETA
             let remaining = max(0, stopS[nextIdx] - prj.s)
             let vObs = max(0.1, tr.speedMps)
             let vForETA = max(SPEED_FLOOR_MPS, vObs)
@@ -1689,14 +2072,27 @@ final class MapVM: ObservableObject {
                 b.etaMinutes = prev
             }
 
-            // 6) 정류장 스냅(근접+저속 시 dwel 잠깐 고정)
-            maybeSnapToStop(&b)  // ← 아래 2)로 교체될 메서드
+            // 6) 스냅
+            maybeSnapToStop(&b)
+
+            // ▶ 팔로우 중: 트레일 + 하이라이트 + 미래경로
+            if followBusId == b.id {
+                let c = CLLocationCoordinate2D(latitude: b.lat, longitude: b.lon)
+                trail.appendIfNeeded(c); trailVersion &+= 1
+
+                // 다음 정류장 하이라이트
+                highlightedStopId = nextStop.id
+
+                // ★ 미래 경로 라인 갱신 (핵심 추가)
+                updateFutureRouteIfFollowed(busId: b.id, meta: meta, prj: prj, nextIdx: nextIdx)
+            }
 
             out.append(b)
         }
 
         return out
     }
+
 
 
 
@@ -1799,7 +2195,12 @@ struct ClusteredMapView: UIViewRepresentable {
         let currentStopIds = Set(currentStops.map { $0.stop.id })
 
         // 2) 원하는 상태
-        let desiredStops = vm.stops
+        var desiredStops = vm.stops
+        // ✅ 하이라이트 정류장을 강제로 포함(화면 반경 밖이어도 색 바뀌도록)
+        if let hs = vm.highlightedBusStop(),
+           !desiredStops.contains(where: { $0.id == hs.id }) {
+            desiredStops.append(hs)
+        }
         let desiredBuses = vm.buses
         let desiredStopIds = Set(desiredStops.map { $0.id })
 
@@ -1855,6 +2256,14 @@ struct ClusteredMapView: UIViewRepresentable {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
             context.coordinator.updateFollowTints(uiView)
         }
+        // updateUIView 내 배치 후
+        context.coordinator.updateTrailOverlay(uiView)       // 주황(지나온) 갱신
+        context.coordinator.updateFutureRouteOverlay(uiView) // 빨강(미래) 갱신
+        // 정류장 색상 안전망
+        context.coordinator.recolorStops(uiView)
+
+
+
     }
 
     func makeCoordinator() -> Coord { Coord(self) }
@@ -1868,6 +2277,27 @@ struct ClusteredMapView: UIViewRepresentable {
 
 
         init(_ p: ClusteredMapView) { parent = p }
+        // ClusteredMapView.Coord 내부에 추가
+        // ClusteredMapView.Coord 내부에 넣기 (교체/추가)
+        // ClusteredMapView.Coord
+        // ClusteredMapView.Coord 안에 추가
+        // ClusteredMapView.Coord
+        func updateFutureRouteOverlay(_ mapView: MKMapView) {
+            // 기존 futureRoute 제거 (title 옵셔널 안전비교)
+            let olds = mapView.overlays.compactMap { $0 as? MKPolyline }.filter { ($0.title ?? "") == "futureRoute" }
+            if !olds.isEmpty { mapView.removeOverlays(olds) }
+
+            let coords = parent.vm.futureRouteCoords
+            guard coords.count >= 2 else { return }
+
+            let line = MKPolyline(coordinates: coords, count: coords.count)
+            line.title = "futureRoute"
+            mapView.addOverlay(line)
+        }
+
+
+
+
 
         // 추적 색상 일괄 반영
         func updateFollowTints(_ mapView: MKMapView) {
@@ -1917,6 +2347,7 @@ struct ClusteredMapView: UIViewRepresentable {
 
 
         // ClusteredMapView.Coord 안의 기존 메서드 교체
+        // ClusteredMapView.Coord
         func applyAnnotationDiff(
             on mapView: MKMapView,
             stopsToAdd: [MKAnnotation],
@@ -1947,9 +2378,6 @@ struct ClusteredMapView: UIViewRepresentable {
                     return b
                 }
 
-                let oldDelegate = mapView.delegate
-                mapView.delegate = nil
-
                 UIView.performWithoutAnimation {
                     CATransaction.begin()
                     CATransaction.setDisableActions(true)
@@ -1978,13 +2406,15 @@ struct ClusteredMapView: UIViewRepresentable {
 
                 mapView.setNeedsLayout()
                 mapView.layoutIfNeeded()
-                mapView.delegate = oldDelegate
                 self.isApplyingDiff = false
 
-                // 팔로우 외형 안전망 재적용
+                // ✅ 배치 후 팔로우/정류장 색상 안전망
                 self.updateFollowTints(mapView)
+                self.recolorStops(mapView)   // ← 아래 2) 추가 메서드
             }
         }
+        // ClusteredMapView.Coord
+        
 
 
         func centerOn(_ center: CLLocationCoordinate2D, mapView: MKMapView, animated: Bool) {
@@ -2011,18 +2441,18 @@ struct ClusteredMapView: UIViewRepresentable {
         // ClusteredMapView.Coord
         func mapView(_ mapView: MKMapView, viewFor annotation: MKAnnotation) -> MKAnnotationView? {
             if let s = annotation as? BusStopAnnotation {
-                let v = mapView.dequeueReusableAnnotationView(withIdentifier: "stop", for: s) as! MKMarkerAnnotationView
-                v.clusteringIdentifier = "stop"
-                v.glyphText = "🚏"
-                v.markerTintColor = .systemRed
+                    let v = mapView.dequeueReusableAnnotationView(withIdentifier: "stop", for: s) as! MKMarkerAnnotationView
+                    v.clusteringIdentifier = "stop"
+                    v.glyphText = "🚏"
 
-                // ✅ 정류소도 버스와 '동급' 레벨에서 항상 보이도록
-                v.titleVisibility = .visible
-                v.subtitleVisibility = .hidden
-                v.displayPriority = .required
-                v.layer.zPosition = 100
+                    // ▶ 다음 정류장만 노란색, 나머지는 빨강
+                    v.markerTintColor = (parent.vm.highlightedStopId == s.stop.id) ? .systemYellow : .systemRed
 
-                return v
+                    v.titleVisibility = .visible
+                    v.subtitleVisibility = .hidden
+                    v.displayPriority = .required
+                    v.layer.zPosition = 100
+                    return v
 
             } else if let b = annotation as? BusAnnotation {
                 let v = mapView.dequeueReusableAnnotationView(withIdentifier: "bus", for: b) as! BusMarkerView
@@ -2118,59 +2548,112 @@ struct ClusteredMapView: UIViewRepresentable {
         }
 
 
-        // **탭 토글**: 같은 버스를 다시 누르면 해제, 해제 후 다시 누르면 재추적
+        
+        // **탭 토글**: 같은 버스를 다시 누르면 해제, 아니면 추적 시작
+        // ClusteredMapView.Coord
         func mapView(_ mapView: MKMapView, didSelect view: MKAnnotationView) {
             guard let bus = view.annotation as? BusAnnotation else { return }
 
             let already = (parent.vm.followBusId == bus.id)
             if already {
+                // ▶ 추적 해제
                 parent.vm.followBusId = nil
                 if let mv = view as? BusMarkerView { mv.configureTint(isFollowed: false) }
             } else {
+                // ▶ 추적 시작
                 parent.vm.followBusId = bus.id
                 follow(bus, on: mapView)
-                if let mv = view as? BusMarkerView { mv.configureTint(isFollowed: true); mv.updateAlwaysOnBubble() }
-                // ✅ 바로 호출 대신 다음 런루프로 미룸(열거 충돌 방지)
-                DispatchQueue.main.async { [weak self, weak mapView] in
-                    guard let self, let mapView else { return }
-                    self.updateFollowTints(mapView)
+
+                if let mv = view as? BusMarkerView {
+                    mv.configureTint(isFollowed: true)
+                    mv.updateAlwaysOnBubble()
                 }
 
-                // didDeselect / calloutAccessoryControlTapped 토글 후에도 동일하게:
-                DispatchQueue.main.async { [weak self, weak mapView] in
-                    guard let self, let mapView else { return }
-                    self.updateFollowTints(mapView)
+                // 1) 트레일 시작
+                parent.vm.startTrail(for: bus.id, seed: bus.coordinate)
+
+                // 2) 미래 경로: 이전 것 제거 → 임시 폴백 → 메타 되면 진짜 라인으로 교체
+                parent.vm.clearFutureRoute()
+
+                // (a) 임시 폴백 직선 빨간선
+                parent.vm.setTemporaryFutureRouteFromBus(busId: bus.id, coordinate: bus.coordinate)
+                self.updateFutureRouteOverlay(mapView)
+
+                // (b) 메타 확보 시도: 백오프 재시도 + 즉시 한 번 그려보기
+                if let rid = parent.vm.routeId(forRouteNo: bus.routeNo) {
+                    parent.vm.ensureRouteMetaWithRetry(routeId: rid)          // 비어있으면 주기적으로 재시도
+                    parent.vm.trySetFutureRouteImmediately(for: bus)          // 메타 있으면 바로 계산
+                    self.updateFutureRouteOverlay(mapView)
                 }
-                // ✅ 노선 정류장 목록 사전 로드
+
+                // 3) 다음 정류장 하이라이트 즉시 반영
+                if let live = parent.vm.buses.first(where: { $0.id == bus.id }) {
+                    parent.vm.updateHighlightStop(for: live)
+                    self.recolorStops(mapView)
+                }
+
+                // 노선 메타 프리페치(성공하면 임시 빨간선이 자동 교체됨)
                 Task { await self.parent.vm.onBusSelected(bus) }
             }
 
+            // 토글 UX: 선택표시 해제
             mapView.deselectAnnotation(bus, animated: false)
         }
 
 
-        func mapView(_ mapView: MKMapView, didDeselect view: MKAnnotationView) {
-//            if view is BusMarkerView {
-//                UIView.animate(withDuration: 0.2) { view.transform = .identity }
-//                // 버튼 라벨은 선택 해제와 무관 (토글은 didSelect/callout에서만)
-//            }
-        }
+
+
+//        func mapView(_ mapView: MKMapView, didDeselect view: MKAnnotationView) {
+////            if view is BusMarkerView {
+////                UIView.animate(withDuration: 0.2) { view.transform = .identity }
+////                // 버튼 라벨은 선택 해제와 무관 (토글은 didSelect/callout에서만)
+////            }
+//        }
 
         // 콜아웃 버튼으로도 토글
-        func mapView(_ mapView: MKMapView, annotationView view: MKAnnotationView, calloutAccessoryControlTapped control: UIControl) {
+        // ClusteredMapView.Coord
+        func mapView(_ mapView: MKMapView,
+                     annotationView view: MKAnnotationView,
+                     calloutAccessoryControlTapped control: UIControl) {
             guard let bus = view.annotation as? BusAnnotation else { return }
+
             if parent.vm.followBusId == bus.id {
+                // ▶ 팔로우 해제
                 parent.vm.followBusId = nil
                 mapView.deselectAnnotation(bus, animated: true)
                 if let mv = view as? BusMarkerView { mv.configureTint(isFollowed: false) }
-                if let mv = view as? BusMarkerView, let btn = mv.rightCalloutAccessoryView as? UIButton { btn.setTitle("추적", for: .normal) }
+                if let mv = view as? BusMarkerView, let btn = mv.rightCalloutAccessoryView as? UIButton {
+                    btn.setTitle("추적", for: .normal)
+                }
+
+                // ✅ 트레일 종료
+                parent.vm.stopTrail()
+                parent.vm.clearFutureRoute()          // ✅ 미래 경로 지우기
+                    self.updateFutureRouteOverlay(mapView)
+
+                // (선택) 하이라이트 정류장 초기화
+                parent.vm.highlightedStopId = nil
+
             } else {
+                // ▶ 팔로우 시작
                 parent.vm.followBusId = bus.id
                 follow(bus, on: mapView)
                 if let mv = view as? BusMarkerView { mv.configureTint(isFollowed: true); mv.updateAlwaysOnBubble() }
-                if let mv = view as? BusMarkerView, let btn = mv.rightCalloutAccessoryView as? UIButton { btn.setTitle("해제", for: .normal) }
+                if let mv = view as? BusMarkerView, let btn = mv.rightCalloutAccessoryView as? UIButton {
+                    btn.setTitle("해제", for: .normal)
+                }
+
+                // ✅ 트레일 시작
+                parent.vm.startTrail(for: bus.id, seed: bus.coordinate)
+
+                // (선택) 바로 정류장 하이라이트 갱신 안전망
+                DispatchQueue.main.async { [weak self, weak mapView] in
+                    guard let self, let mapView else { return }
+                    self.updateFollowTints(mapView)
+                }
             }
         }
+
 
         // 지도가 움직였을 때: 사용자 제스처가 아니더라도, 팔로우 중이면 주기적으로 정류장 재로딩
         // ClusteredMapView.Coord
@@ -2180,6 +2663,62 @@ struct ClusteredMapView: UIViewRepresentable {
                 self.parent.vm.onRegionCommitted(mapView.region)
             }
         }
+        
+        
+        // rendererFor overlay
+        // ClusteredMapView.Coord
+        func mapView(_ mapView: MKMapView, rendererFor overlay: MKOverlay) -> MKOverlayRenderer {
+            guard let line = overlay as? MKPolyline else {
+                return MKOverlayRenderer(overlay: overlay)
+            }
+            let r = MKPolylineRenderer(polyline: line)
+            if line.title == "busTrail" {
+                r.strokeColor = .systemOrange   // 지나온 경로(주황/노랑계열)
+                r.lineWidth = 4
+                r.lineJoin = .round
+                r.lineCap  = .round
+                return r
+            } else if line.title == "futureRoute" {
+                r.strokeColor = .systemRed      // 앞으로 갈 경로(빨강)
+                r.lineWidth = 4
+                r.lineJoin = .round
+                r.lineCap  = .round
+                return r
+            } else {
+                r.strokeColor = .systemGray
+                r.lineWidth = 3
+                return r
+            }
+        }
+
+
+        
+        
+        
+
+        // ClusteredMapView.Coord
+        func recolorStops(_ mapView: MKMapView) {
+            let targetId = parent.vm.highlightedStopId
+            for a in mapView.annotations {
+                guard let s = a as? BusStopAnnotation,
+                      let v = mapView.view(for: s) as? MKMarkerAnnotationView else { continue }
+                v.markerTintColor = (s.stop.id == targetId) ? .systemYellow : .systemRed
+            }
+        }
+
+
+
+        // 트레일 업데이트 유틸
+        func updateTrailOverlay(_ mapView: MKMapView) {
+            // 기존 트레일 제거
+            let olds = mapView.overlays.filter { ($0 as? MKPolyline)?.title == "busTrail" }
+            mapView.removeOverlays(olds)
+            // 새 트레일 추가
+            if let line = parent.vm.trail.polyline() {
+                mapView.addOverlay(line)
+            }
+        }
+
 
     }
 }
@@ -2347,5 +2886,60 @@ struct TrackingBadgeView: View {
             .transition(.move(edge: .top).combined(with: .opacity))
             .accessibilityLabel("추적 중 배지")
         }
+    }
+}
+
+
+// 새 파일 or MapVM 내부
+import MapKit
+
+/// 과거 이동경로(트레일) 저장소
+final class BusTrailStore {
+
+    // 최근 팔로우 중인 버스 id (옵션)
+    private(set) var currentBusId: String?
+
+    // 경로 좌표
+    private var points: [CLLocationCoordinate2D] = []
+
+    // 성능/메모리 보호
+    private let maxCount: Int = 800        // 최대 점수 (적당히 조절)
+    private let minStepMeters: CLLocationDistance = 6   // 일정 거리 이상 이동했을 때만 기록
+
+    // 시작/중지
+    func start(id: String, seed: CLLocationCoordinate2D?) {
+        currentBusId = id
+        points.removeAll()
+        if let s = seed, CLLocationCoordinate2DIsValid(s) {
+            points.append(s)
+        }
+    }
+
+    func stop() {
+        currentBusId = nil
+        points.removeAll()
+    }
+
+    // 위치 추가(너무 촘촘하면 생략)
+    func appendIfNeeded(_ c: CLLocationCoordinate2D) {
+        guard CLLocationCoordinate2DIsValid(c) else { return }
+        if let last = points.last {
+            let d = CLLocation(latitude: last.latitude, longitude: last.longitude)
+                .distance(from: CLLocation(latitude: c.latitude, longitude: c.longitude))
+            // 너무 가까우면 패스
+            if d < minStepMeters { return }
+        }
+        points.append(c)
+        if points.count > maxCount {
+            points.removeFirst(points.count - maxCount)
+        }
+    }
+
+    // MapKit 오버레이로 만들기
+    func polyline() -> MKPolyline? {
+        guard points.count >= 2 else { return nil }
+        let line = MKPolyline(coordinates: points, count: points.count)
+        line.title = "busTrail"   // ✅ renderer에서 이 타이틀로 주황색 처리
+        return line
     }
 }
