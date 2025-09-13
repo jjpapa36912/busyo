@@ -877,8 +877,8 @@ final class MapVM: ObservableObject {
 
     // MapVM 안에 메서드 추가
     /// 팔로우 중 버스의 앞으로 최대 N개 정류장 + ETA(분) (디버그 로그 강화)
-    // MapVM 안, 기존 메서드 전체 교체
-    func upcomingStops(for busId: String, maxCount: Int = 5) -> [UpcomingStopETA] {
+    // MapVM
+    func upcomingStops(for busId: String, maxCount: Int = 7) -> [UpcomingStopETA] {
         // 0) live
         guard let live = buses.first(where: { $0.id == busId }) else { return [] }
         let here = CLLocationCoordinate2D(latitude: live.lat, longitude: live.lon)
@@ -895,7 +895,6 @@ final class MapVM: ObservableObject {
             let stopS = meta.stopS
             let routeStops = routeStopsByRouteId[ridEff] ?? routeStopsByRouteId[ridRaw] ?? []
             guard !stopS.isEmpty, stopS.count == routeStops.count else {
-                // 메타는 있는데 정류장 매핑이 비정상 → 폴백
                 return upcomingStopsDirectionalFallback(for: busId, maxCount: maxCount)
             }
 
@@ -903,27 +902,128 @@ final class MapVM: ObservableObject {
             let vObs = max(0.1, tracks[busId]?.speedMps ?? 0)
             let vForETA = min(25.0, max(1.5, vObs))
 
-            var result: [UpcomingStopETA] = []
-            var lastETAmin: Int = live.etaMinutes ?? max(0, Int((((stopS[startIdx] - prj.s) / vForETA) / 60.0).rounded()))
+            var out: [UpcomingStopETA] = []
+            var lastETAmin: Int = live.etaMinutes ?? max(0, Int((((stopS[startIdx]-prj.s)/vForETA)/60.0).rounded()))
             let end = min(routeStops.count, startIdx + maxCount)
 
             for j in startIdx..<end {
                 let remainS = max(0, stopS[j] - prj.s)
                 var etaSec = Int(remainS / vForETA)
                 if vObs < 1.2 && remainS < 25 { etaSec = 0 }
-                var etaMin = max(0, Int((Double(etaSec) / 60.0).rounded(.toNearestOrEven)))
+                var etaMin = max(0, Int((Double(etaSec)/60.0).rounded(.toNearestOrEven)))
                 etaMin = max(etaMin, lastETAmin)
                 lastETAmin = etaMin
-
                 let stop = routeStops[j]
-                result.append(.init(id: stop.id, name: stop.name, etaMin: etaMin))
+                out.append(.init(id: stop.id, name: stop.name, etaMin: etaMin))
             }
-            return result
+            return out
         }
 
         // 2) 메타가 없으면 방향기반 폴백
         return upcomingStopsDirectionalFallback(for: busId, maxCount: maxCount)
     }
+    // MapVM
+    @Published private var upcomingTick: Int = 0   // 패널 강제 리렌더용
+
+    private var knownStopsIndex: [String: BusStop] = [:]   // 전역 캐시(지도에 안 뿌림)
+    private var aheadPrefetchInFlight: Set<String> = []    // 중복 프리페치 방지
+    private var aheadPrefetchCooldown: [String: Date] = [:]// 너무 잦은 프리페치 쿨다운
+
+    // MapVM
+    private func prefetchStopsAhead(for busId: String, hops: Int = 6, stepMeters: Double = 400) async {
+        // 쿨다운/중복 가드
+        let now = Date()
+        if aheadPrefetchInFlight.contains(busId) { return }
+        if let until = aheadPrefetchCooldown[busId], until > now { return }
+        aheadPrefetchInFlight.insert(busId)
+        defer { aheadPrefetchInFlight.remove(busId) }
+
+        guard let live = buses.first(where: { $0.id == busId }),
+              let tr = tracks[busId], let dir = tr.dirUnit else { return }
+
+        let lat0 = live.lat, lon0 = live.lon
+        let cosLat = cos(lat0 * .pi/180)
+        let mPerDegLat = 111_320.0
+        let mPerDegLon = 111_320.0 * cosLat
+
+        var newly: [BusStop] = []
+        for i in 1...hops {
+            let dist = Double(i) * stepMeters
+            // dir(x,y)는 미터 기준 단위벡터임: 이를 위경도로 투영
+            let dLat = (dir.y * dist) / mPerDegLat
+            let dLon = (dir.x * dist) / mPerDegLon
+            let lat = lat0 + dLat
+            let lon = lon0 + dLon
+
+            // MOTIE 근접정류장 API 재사용
+            if let arr = try? await api.fetchStops(lat: lat, lon: lon), !arr.isEmpty {
+                newly.append(contentsOf: arr)
+            }
+        }
+
+        if !newly.isEmpty {
+            await MainActor.run {
+                self.integrateKnownStops(newly)
+                self.upcomingTick &+= 1           // ✅ 패널 리렌더 트리거
+            }
+        } else {
+            // 너무 자주 빈손이면 60초 쿨다운
+            aheadPrefetchCooldown[busId] = Date().addingTimeInterval(60)
+        }
+    }
+
+    
+    // MapVM
+    private func upcomingStopsDirectionalFallback(for busId: String, maxCount: Int) -> [UpcomingStopETA] {
+        guard let live = buses.first(where: { $0.id == busId }) else { return [] }
+        let here = CLLocationCoordinate2D(latitude: live.lat, longitude: live.lon)
+        guard let tr = tracks[busId], let dir = tr.dirUnit else { return [] }
+
+        // ✅ 화면근처(vm.stops) + 전역캐시(knownStopsIndex) 둘 다 사용
+        let catalog: [BusStop] = {
+            var dict = [String: BusStop]()
+            for s in stops { dict[s.id] = s }
+            for s in knownStopsIndex.values { dict[s.id] = s }
+            return Array(dict.values)
+        }()
+
+        // 필터 파라미터: 범위를 넉넉히(최대 3.5km 전방, 측면 180m)
+        let aheadMinProj: Double = 8
+        let aheadMaxProj: Double = 3500
+        let lateralMax: Double  = 180
+
+        let vObs  = max(0.1, tr.speedMps)
+        let vForE = max(1.5, min(25.0, vObs))
+
+        struct Cand { let stop: BusStop; let proj: Double; let lateral: Double; let dist: Double }
+        let cands: [Cand] = catalog.map { s in
+            let v = GeoUtil.deltaMeters(from: here, to: .init(latitude: s.lat, longitude: s.lon))
+            let proj = v.dx*dir.x + v.dy*dir.y
+            let lat  = abs(-v.dy*dir.x + v.dx*dir.y)
+            return Cand(stop: s, proj: proj, lateral: lat, dist: v.dist)
+        }
+        .filter { $0.proj >= aheadMinProj && $0.proj <= aheadMaxProj && $0.lateral <= lateralMax }
+        .sorted { $0.proj < $1.proj }
+
+        var out: [UpcomingStopETA] = []
+        var lastETA = live.etaMinutes ?? 0
+        for c in cands.prefix(maxCount) {
+            var etaSec = Int(c.proj / vForE)
+            if vObs < 1.2 && c.dist < 25 { etaSec = 0 }
+            var etaMin = max(0, Int((Double(etaSec)/60.0).rounded(.toNearestOrEven)))
+            etaMin = max(etaMin, lastETA)
+            lastETA = etaMin
+            out.append(.init(id: c.stop.id, name: c.stop.name, etaMin: etaMin))
+        }
+
+        // ✅ 모자라면 즉시 전방 프리페치 비동기 가동(결과 들어오면 패널 자동 업데이트)
+        if out.count < maxCount {
+            Task { await self.prefetchStopsAhead(for: busId) }
+        }
+
+        return out
+    }
+
 
 
 
@@ -948,6 +1048,20 @@ final class MapVM: ObservableObject {
         }
         return lo // lo <= s < hi
     }
+    
+    // MapVM
+    private var metaInFlight = Set<String>()              // 같은 노선 중복요청 방지
+    private var metaCooldownUntil = [String: Date]()      // 실패 쿨다운
+    // MapVM
+    private func isCoolingDown(_ id: String) -> Bool {
+        if let until = metaCooldownUntil[id] { return until > Date() }
+        return false
+    }
+    private func startCooldown(_ id: String, minutes: Int = 15) {
+        metaCooldownUntil[id] = Date().addingTimeInterval(Double(minutes) * 60)
+    }
+    private func clearCooldown(_ id: String) { metaCooldownUntil[id] = nil }
+
     // MapVM 안에 교체(기존 setFutureRoute... 대체)
     /// 현재 사영점(prj)에서 '다음 정류장(nextIdx)' → 그다음 정류장… 순으로,
     // 미래 경로를 정류장들로 이어서 생성
@@ -1484,17 +1598,49 @@ final class MapVM: ObservableObject {
     }
 
     // MapVM 안에 추가: 메타 재시도(지수 백오프)
-    func ensureRouteMetaWithRetry(routeId: String, maxAttempts: Int = 5) {
+    // MapVM
+    // MapVM
+    // MapVM
+    @MainActor
+    func ensureRouteMetaWithRetry(routeId rawRouteId: String, routeNo: String? = nil) {
+        // 메인 액터에서 in-flight / 쿨다운 가드
+        if isCoolingDown(rawRouteId) { return }
+        if metaInFlight.contains(rawRouteId) { return }
+        metaInFlight.insert(rawRouteId)
+
+        // 현재 액터 컨텍스트 상속 (detached 금지)
         Task { [weak self] in
             guard let self else { return }
-            for attempt in 1...maxAttempts {
-                await self.ensureRouteMeta(routeId: routeId)
-                if let meta = self.routeMetaById[routeId], meta.shape.count >= 2 { break }
-                let backoff = UInt64(min( pow(2.0, Double(attempt-1)) * 0.8, 8.0 ) * 1_000_000_000)
-                try? await Task.sleep(nanoseconds: backoff)
+
+            let backoff: [Double] = [0.0, 2.0, 5.0]   // 초 단위
+            var succeeded = false
+
+            for (i, delay) in backoff.enumerated() {
+                if delay > 0 {
+                    try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+                }
+
+                let ok = await self.ensureRouteMetaOnce(rawRouteId: rawRouteId, routeNo: routeNo)
+                if ok {                       // 성공 → 루프 종료 (return 금지)
+                    succeeded = true
+                    break
+                }
+
+                if i == backoff.indices.last { // 마지막 시도 실패 → 쿨다운
+                    await self.startCooldown(rawRouteId, minutes: 15)
+                    print("⚠️ ensureRouteMeta cooldown 15m for \(rawRouteId)")
+                }
+            }
+
+            // 항상 마지막에 in-flight 제거 (메인 액터 hop)
+            await MainActor.run { [weak self] in
+                guard let self else { return }
+                self.metaInFlight.remove(rawRouteId)
             }
         }
     }
+
+
     /// 기존 호출부용 오버로드: routeId만 주어졌을 때 routeNo를 역캐시에서 찾아서 넘겨줌
     // (호환용)
     // MapVM 안에 있던 ensureRouteMeta(routeId:)를 아래 두 개로 교체
@@ -1610,43 +1756,7 @@ final class MapVM: ObservableObject {
 //    }
 
     // MapVM 안, private helpers 섹션
-    /// 메타가 없을 때: 현재 버스 진행방향으로 앞쪽 정류장들을 추정해 ETA 계산
-    private func upcomingStopsDirectionalFallback(for busId: String, maxCount: Int) -> [UpcomingStopETA] {
-        guard let live = buses.first(where: { $0.id == busId }) else { return [] }
-        let here = CLLocationCoordinate2D(latitude: live.lat, longitude: live.lon)
-
-        guard let tr = tracks[busId], let dir = tr.dirUnit else { return [] }
-
-        // 주변 stops 풀에서 방향성 기반 필터
-        let aheadMinProj: Double = 8          // 최소 "앞쪽"으로 간주할 투영(m)
-        let aheadMaxProj: Double = 2000       // 최대 2km 앞까지만
-        let lateralMax: Double  = 120         // 측방 120m 이내
-        let vObs = max(0.1, tr.speedMps)
-        let vForETA = max(1.5, min(25.0, vObs))
-
-        struct Cand { let stop: BusStop; let proj: Double; let lateral: Double; let dist: Double }
-        let cands: [Cand] = stops.map { s -> Cand in
-            let v = GeoUtil.deltaMeters(from: here, to: .init(latitude: s.lat, longitude: s.lon))
-            let proj = v.dx*dir.x + v.dy*dir.y
-            let lat  = abs(-v.dy*dir.x + v.dx*dir.y)
-            return Cand(stop: s, proj: proj, lateral: lat, dist: v.dist)
-        }
-        .filter { $0.proj >= aheadMinProj && $0.proj <= aheadMaxProj && $0.lateral <= lateralMax }
-        .sorted { $0.proj < $1.proj }
-
-        var out: [UpcomingStopETA] = []
-        var lastETA = live.etaMinutes ?? 0
-        for c in cands.prefix(maxCount) {
-            var etaSec = Int(c.proj / vForETA)
-            if vObs < 1.2 && c.dist < 25 { etaSec = 0 }
-            var etaMin = max(0, Int((Double(etaSec)/60.0).rounded(.toNearestOrEven)))
-            etaMin = max(etaMin, lastETA)   // 비감소 보장
-            lastETA = etaMin
-            out.append(.init(id: c.stop.id, name: c.stop.name, etaMin: etaMin))
-        }
-        return out
-    }
-
+   
 
     
     // routeNo -> routeId 해석
@@ -2006,7 +2116,59 @@ final class MapVM: ObservableObject {
 
         return ([], nil)
     }
+    // MapVM
+    private func ensureRouteMetaOnce(rawRouteId: String, routeNo: String?) async -> Bool {
+        // 캐시 히트
+        if let m = routeMetaById[rawRouteId], m.shape.count >= 2, m.shape.count == m.cumul.count { return true }
+        if let no = routeNo, let num = numericRouteIdByRouteNo[no],
+           let m2 = routeMetaById[num], m2.shape.count >= 2, m2.shape.count == m2.cumul.count {
+            routeMetaById[rawRouteId] = m2
+            return true
+        }
 
+        // 1) 정류장 확보
+        let (stops, usedId) = await fetchStopsForRoute(rawRouteId: rawRouteId, routeNo: routeNo)
+        let idForCache = usedId ?? (numericRouteId(from: rawRouteId) ?? rawRouteId)
+
+        // 2) 경로(path) 요청 (numeric 우선)
+        var shape: [CLLocationCoordinate2D] = []
+        if let num = numericRouteId(from: rawRouteId) {
+            shape = (try? await api.fetchRoutePath(cityCode: CITY_CODE, routeId: num)) ?? []
+        }
+        if shape.count < 2 {
+            shape = (try? await api.fetchRoutePath(cityCode: CITY_CODE, routeId: rawRouteId)) ?? []
+        }
+
+        // 3) 폴백: path가 없고 stops가 있으면 정류장 연결로 대체
+        if shape.count < 2, stops.count >= 2 {
+            shape = stops.map { CLLocationCoordinate2D(latitude: $0.lat, longitude: $0.lon) }
+        }
+
+        let cumul = buildCumul(shape)
+        guard shape.count >= 2, cumul.count == shape.count else { return false }
+
+        let stopS = stopsProjectedS(stops, shape: shape, cumul: cumul)
+        let meta = RouteMeta(
+            shape: shape, cumul: cumul,
+            stopIds: stops.map { $0.id },
+            stopCoords: stops.map { .init(latitude: $0.lat, longitude: $0.lon) },
+            stopS: stopS
+        )
+
+        // 양쪽 키에 캐시
+        routeMetaById[idForCache] = meta
+        routeMetaById[rawRouteId] = meta
+        if let no = routeNo, let num = numericRouteId(from: rawRouteId) {
+            numericRouteIdByRouteNo[no] = num
+        }
+        clearCooldown(rawRouteId); clearCooldown(idForCache)
+        return true
+    }
+
+    // MapVM
+    private func integrateKnownStops(_ arr: [BusStop]) {
+        for s in arr { knownStopsIndex[s.id] = s }
+    }
 
     @MainActor
     func reload(center: CLLocationCoordinate2D) async {
@@ -2014,10 +2176,14 @@ final class MapVM: ObservableObject {
         let epoch = epochCounter
         self.lastStopRefreshCenter = center
 
-        // 1) 정류장
+        // 1) 정류장upcomingStopsDirectionalFallback
         do {
             let stops = try await api.fetchStops(lat: center.latitude, lon: center.longitude)
-            applyIfCurrent(epoch: epoch) { self.stops = stops }
+            applyIfCurrent(epoch: epoch) {
+                self.stops = stops
+                self.integrateKnownStops(stops)   // ✅ 추가: 전역 캐시 갱신(지도엔 안 뿌림)
+
+            }
         } catch {
             let ns = error as NSError
             if !(ns.domain == NSURLErrorDomain && ns.code == NSURLErrorCancelled) {
@@ -3213,9 +3379,13 @@ struct BusMapScreen: View {
         }
         
         // BusMapScreen.body 에 이미 있는 overlay들 아래/근처에 추가
+        // BusMapScreen body의 overlay들 아래에 추가
         .overlay(alignment: .bottomLeading) {
-            UpcomingStopsPanel(vm: vm)
+            UpcomingPanelView(vm: vm)
+                .padding(.leading, 8)
+                .padding(.bottom, 12)
         }
+
 
         // ✅ 상단 배너 (노치/상단바와 겹치지 않음)
         // 🔽 레이아웃에 영향 주지 않는 오버레이로 하단에 배너 고정
@@ -3386,7 +3556,7 @@ import SwiftUI
 
 struct UpcomingStopsPanel: View {
     @ObservedObject var vm: MapVM
-    let maxCount: Int = 5
+    let maxCount: Int = 7
 
     // 계산 프로퍼티로 분리 (ViewBuilder 바깥)
     private var items: [UpcomingStopETA] {
@@ -3441,5 +3611,43 @@ struct UpcomingStopsPanel: View {
         .allowsHitTesting(false)     // 맵 제스처 방해 X
         .transition(.move(edge: .leading).combined(with: .opacity))
         .zIndex(999)                 // 다른 오버레이 위로
+    }
+}
+
+// 새 파일 또는 같은 파일 하단
+struct UpcomingPanelView: View {
+    @ObservedObject var vm: MapVM
+    var body: some View {
+        Group {
+            if let fid = vm.followBusId,
+               let live = vm.buses.first(where: { $0.id == fid }) {
+                let items = vm.upcomingStops(for: fid, maxCount: 5)
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack(spacing: 8) {
+                        Text("🗺️ \(live.routeNo)")
+                            .font(.caption).bold()
+                        Text(live.nextStopName ?? "다음 정류장 추정중…")
+                            .font(.caption)
+                            .lineLimit(1)
+                    }
+                    ForEach(items, id: \.id) { it in
+                        HStack {
+                            Circle().frame(width: 6, height: 6)
+                            Text(it.name).font(.caption).lineLimit(1)
+                            Spacer(minLength: 8)
+                            Text("\(it.etaMin)분").font(.caption2).monospacedDigit()
+                        }
+                    }
+                    if items.isEmpty {
+                        Text("경로 메타 없음 — 근처/방향 기반으로 추정중")
+                            .font(.caption2).foregroundStyle(.secondary)
+                    }
+                }
+                .padding(10)
+                .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                .shadow(radius: 2)
+            }
+        }
+        .animation(.default, value: vm.followBusId)
     }
 }
