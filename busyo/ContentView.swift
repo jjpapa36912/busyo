@@ -846,6 +846,8 @@ final class MapVM: ObservableObject {
     // MapVM 프로퍼티에 추가
     private var kfByBusId: [String: KF1D.State] = [:]
     private var kf = KF1D()
+    // MapVM 클래스 맨 위 @Published 모음 근처에 추가
+    @Published var stickToFollowedBus: Bool = false   // 팔로우 시 자동 재센터링 여부 (기본: 꺼짐)
 
     
     // MapVM 안에 추가
@@ -923,7 +925,7 @@ final class MapVM: ObservableObject {
         return upcomingStopsDirectionalFallback(for: busId, maxCount: maxCount)
     }
     // MapVM
-    @Published private var upcomingTick: Int = 0   // 패널 강제 리렌더용
+    @Published private(set) var upcomingTick: Int = 0
 
     private var knownStopsIndex: [String: BusStop] = [:]   // 전역 캐시(지도에 안 뿌림)
     private var aheadPrefetchInFlight: Set<String> = []    // 중복 프리페치 방지
@@ -1066,20 +1068,35 @@ final class MapVM: ObservableObject {
     /// 현재 사영점(prj)에서 '다음 정류장(nextIdx)' → 그다음 정류장… 순으로,
     // 미래 경로를 정류장들로 이어서 생성
     // MapVM 안 (기존 futureRouteCoords 사용)
+    // MapVM 안 (기존 메서드 교체)
     func setFutureRouteByStops(
         meta: RouteMeta,
         from prj: (snapped: CLLocationCoordinate2D, s: Double, seg: Int, lateral: Double),
-        nextIdx: Int
+        nextIdx: Int,
+        maxAheadStops: Int = 7,
+        includeTerminal: Bool = true   // 필요하면 마지막 정류장 포함/제외 선택
     ) {
-        // 시작점 = 현재 위치를 경로에 사영한 점
+        // 시작점 = 현재 위치(경로 위 사영점)
         var coords: [CLLocationCoordinate2D] = [prj.snapped]
 
-        // 다음 정류장부터 종점까지 정류장 좌표를 차례대로 이어붙이기
-        if nextIdx < meta.stopCoords.count {
-            coords.append(contentsOf: meta.stopCoords[nextIdx...])
+        // 경계 보정
+        guard nextIdx < meta.stopCoords.count else {
+            futureRouteCoords.removeAll()
+            futureRouteVersion &+= 1
+            return
         }
 
-        // 너무 짧으면 지우고, 아니면 적용
+        // 다음 정류장부터 최대 N개만 이어 붙이기
+        var end = min(meta.stopCoords.count - 1, nextIdx + maxAheadStops - 1)
+        if !includeTerminal, end == meta.stopCoords.count - 1 {
+            end = max(nextIdx, end - 1)
+        }
+
+        if nextIdx <= end {
+            coords.append(contentsOf: meta.stopCoords[nextIdx...end])
+        }
+
+        // 너무 짧으면 지우기
         if coords.count >= 2 {
             futureRouteCoords = coords
         } else {
@@ -1252,7 +1269,7 @@ final class MapVM: ObservableObject {
         let nextIdx = max(0, meta.stopS.firstIndex(where: { $0 > prj.s }) ?? (meta.stopS.count - 1))
 
         // ⬇️ 정류장 좌표만 이어서 빨간 라인
-        setFutureRouteByStops(meta: meta, from: prj, nextIdx: nextIdx)
+        setFutureRouteByStops(meta: meta, from: prj, nextIdx: nextIdx, maxAheadStops: 7, includeTerminal: false)
     }
 
 
@@ -2517,7 +2534,7 @@ final class MapVM: ObservableObject {
                 highlightedStopId = nextStop.id
 
                 // ⬇️ 정류장 단위로 빨간 라인 갱신
-                setFutureRouteByStops(meta: meta, from: prj, nextIdx: nextIdx)
+                setFutureRouteByStops(meta: meta, from: prj, nextIdx: nextIdx, maxAheadStops: 7, includeTerminal: false)
             }
 
 
@@ -2583,6 +2600,44 @@ final class MapVM: ObservableObject {
     private func isMotieRouteId(_ id: String) -> Bool {
         // 순수 숫자이거나, "DJB"로 시작하는 로컬 ID는 모두 허용
         return Int(id) != nil || id.hasPrefix("DJB")
+    }
+    // MapVM 안에 추가
+    func redrawFutureRouteFromUpcoming(busId: String, maxCount: Int = 7) {
+        // 0) 라이브/루트 메타 확보
+        guard let live = buses.first(where: { $0.id == busId }) else { return }
+        let here = CLLocationCoordinate2D(latitude: live.lat, longitude: live.lon)
+
+        let routeNo = routeNoById[busId] ?? live.routeNo
+        guard let rid = resolveRouteId(for: routeNo),
+              let meta = routeMetaById[rid],
+              meta.shape.count >= 2,
+              meta.shape.count == meta.cumul.count,
+              let prj = projectOnRoute(here, shape: meta.shape, cumul: meta.cumul) else {
+            // 메타 없으면 임시 직선 폴백
+            setTemporaryFutureRouteFromBus(busId: busId, coordinate: here, meters: 1200)
+            return
+        }
+
+        // 1) 현재 패널에서 쓰는 목록과 동일하게 다음 정류장 추출 (중복 제거 포함)
+        let raw = upcomingStops(for: busId, maxCount: maxCount)
+        var seen = Set<String>()
+        let nexts = raw.filter { seen.insert($0.id).inserted }
+
+        // 2) 현재 스냅점 + 정류장 좌표(최대 N개)만 직선으로 잇는 꺾은선 구성
+        var coords: [CLLocationCoordinate2D] = [prj.snapped]
+        for it in nexts {
+            if let j = meta.stopIds.firstIndex(of: it.id) {
+                coords.append(meta.stopCoords[j])
+            }
+        }
+
+        // 3) 적용
+        if coords.count >= 2 {
+            futureRouteCoords = coords
+        } else {
+            futureRouteCoords.removeAll()
+        }
+        futureRouteVersion &+= 1
     }
 
     // ✅ 공격적 필터 → 안전한 폴백 포함
@@ -2835,7 +2890,7 @@ struct ClusteredMapView: UIViewRepresentable {
         )
 
         // 4) 팔로우 중이면 재센터+색상 최신화
-        if let followId = vm.followBusId {
+        if let followId = vm.followBusId, vm.stickToFollowedBus {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
                 if let anno = uiView.annotations.first(where: { ($0 as? BusAnnotation)?.id == followId }) as? BusAnnotation {
                     context.coordinator.follow(anno, on: uiView)
@@ -3157,7 +3212,9 @@ struct ClusteredMapView: UIViewRepresentable {
             } else {
                 // ▶ 추적 시작
                 parent.vm.followBusId = bus.id
-                follow(bus, on: mapView)
+                if parent.vm.stickToFollowedBus {
+                    follow(bus, on: mapView)
+                }
 
                 if let mv = view as? BusMarkerView {
                     mv.configureTint(isFollowed: true)
@@ -3232,7 +3289,9 @@ struct ClusteredMapView: UIViewRepresentable {
             } else {
                 // ▶ 팔로우 시작
                 parent.vm.followBusId = bus.id
-                follow(bus, on: mapView)
+                if parent.vm.stickToFollowedBus {
+                    follow(bus, on: mapView)
+                }
                 if let mv = view as? BusMarkerView { mv.configureTint(isFollowed: true); mv.updateAlwaysOnBubble() }
                 if let mv = view as? BusMarkerView, let btn = mv.rightCalloutAccessoryView as? UIButton {
                     btn.setTitle("해제", for: .normal)
@@ -3627,49 +3686,71 @@ struct UpcomingStopsPanel: View {
 // 새 파일 또는 같은 파일 하단
 struct UpcomingPanelView: View {
     @ObservedObject var vm: MapVM
+
     var body: some View {
         Group {
-            if let fid = vm.followBusId,
-               let live = vm.buses.first(where: { $0.id == fid }) {
-
-                // 원래 목록
-                let items = vm.upcomingStops(for: fid, maxCount: 7)
-
-                // ▶ id 기준 중복 제거(표시용)
-                let unique: [UpcomingStopETA] = {
-                    var seen = Set<String>()
-                    return items.filter { seen.insert($0.id).inserted }
-                }()
-
-                VStack(alignment: .leading, spacing: 6) {
-                    HStack(spacing: 8) {
-                        Text("🗺️ \(live.routeNo)")
-                            .font(.caption).bold()
-                        Text(live.nextStopName ?? "다음 정류장 추정중…")
-                            .font(.caption)
-                            .lineLimit(1)
-                    }
-
-                    // ▶ 중복 제거된 목록으로 표시
-                    ForEach(unique, id: \.id) { it in
-                        HStack {
-                            Circle().frame(width: 6, height: 6)
-                            Text(it.name).font(.caption).lineLimit(1)
-                            Spacer(minLength: 8)
-                            Text("\(it.etaMin)분").font(.caption2).monospacedDigit()
-                        }
-                    }
-
-                    if unique.isEmpty {
-                        Text("경로 메타 없음 — 근처/방향 기반으로 추정중")
-                            .font(.caption2).foregroundStyle(.secondary)
-                    }
+            if let fid = vm.followBusId {
+                if let live = vm.buses.first(where: { $0.id == fid }) {
+                    UpcomingPanelContent(vm: vm, fid: fid, live: live)
                 }
-                .padding(10)
-                .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
-                .shadow(radius: 2)
             }
         }
-        .animation(.default, value: vm.followBusId)
+    }
+}
+
+private struct UpcomingPanelContent: View {
+    @ObservedObject var vm: MapVM
+    let fid: String
+    let live: BusLive
+
+    var body: some View {
+        // 목록 생성
+        let itemsRaw = vm.upcomingStops(for: fid, maxCount: 7)
+        let items: [UpcomingStopETA] = {
+            var seen = Set<String>()
+            return itemsRaw.filter { seen.insert($0.id).inserted }
+        }()
+
+        return VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 8) {
+                Text("🗺️ \(live.routeNo)")
+                    .font(.caption).bold()
+                Text(live.nextStopName ?? "다음 정류장 추정중…")
+                    .font(.caption)
+                    .lineLimit(1)
+            }
+
+            ForEach(items, id: \.id) { it in
+                HStack {
+                    Circle().frame(width: 6, height: 6)
+                    Text(it.name).font(.caption).lineLimit(1)
+                    Spacer(minLength: 8)
+                    Text("\(it.etaMin)분").font(.caption2).monospacedDigit()
+                }
+            }
+
+            if items.isEmpty {
+                Text("경로 메타 없음 — 근처/방향 기반으로 추정중")
+                    .font(.caption2).foregroundStyle(.secondary)
+            }
+        }
+        .padding(10)
+        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .shadow(radius: 2)
+        // 빨간 라인 갱신
+        .onAppear {
+            vm.redrawFutureRouteFromUpcoming(busId: fid, maxCount: 7)
+        }
+        .onChange(of: vm.upcomingTick) { _ in
+            vm.redrawFutureRouteFromUpcoming(busId: fid, maxCount: 7)
+        }
+        .onChange(of: vm.followBusId) { _ in
+            if let fid2 = vm.followBusId {
+                vm.redrawFutureRouteFromUpcoming(busId: fid2, maxCount: 7)
+            }
+        }
+        .onChange(of: items.map(\.id).joined(separator: "|")) { _ in
+            vm.redrawFutureRouteFromUpcoming(busId: fid, maxCount: 7)
+        }
     }
 }
