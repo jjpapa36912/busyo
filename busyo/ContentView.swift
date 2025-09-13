@@ -3559,9 +3559,19 @@ struct UpcomingStopsPanel: View {
     let maxCount: Int = 7
 
     // 계산 프로퍼티로 분리 (ViewBuilder 바깥)
+    // 기존
+    // private var items: [UpcomingStopETA] {
+    //     guard let fid = vm.followBusId else { return [] }
+    //     return vm.upcomingStops(for: fid, maxCount: maxCount)
+    // }
+
+    // 변경
     private var items: [UpcomingStopETA] {
         guard let fid = vm.followBusId else { return [] }
-        return vm.upcomingStops(for: fid, maxCount: maxCount)
+        let arr = vm.upcomingStops(for: fid, maxCount: maxCount)
+        var seen = Set<String>()
+        // ▶ id 기준, 최초 1회만 통과 (안정적인 순서 유지)
+        return arr.filter { seen.insert($0.id).inserted }
     }
 
     var body: some View {
@@ -3621,7 +3631,16 @@ struct UpcomingPanelView: View {
         Group {
             if let fid = vm.followBusId,
                let live = vm.buses.first(where: { $0.id == fid }) {
-                let items = vm.upcomingStops(for: fid, maxCount: 5)
+
+                // 원래 목록
+                let items = vm.upcomingStops(for: fid, maxCount: 7)
+
+                // ▶ id 기준 중복 제거(표시용)
+                let unique: [UpcomingStopETA] = {
+                    var seen = Set<String>()
+                    return items.filter { seen.insert($0.id).inserted }
+                }()
+
                 VStack(alignment: .leading, spacing: 6) {
                     HStack(spacing: 8) {
                         Text("🗺️ \(live.routeNo)")
@@ -3630,7 +3649,9 @@ struct UpcomingPanelView: View {
                             .font(.caption)
                             .lineLimit(1)
                     }
-                    ForEach(items, id: \.id) { it in
+
+                    // ▶ 중복 제거된 목록으로 표시
+                    ForEach(unique, id: \.id) { it in
                         HStack {
                             Circle().frame(width: 6, height: 6)
                             Text(it.name).font(.caption).lineLimit(1)
@@ -3638,7 +3659,8 @@ struct UpcomingPanelView: View {
                             Text("\(it.etaMin)분").font(.caption2).monospacedDigit()
                         }
                     }
-                    if items.isEmpty {
+
+                    if unique.isEmpty {
                         Text("경로 메타 없음 — 근처/방향 기반으로 추정중")
                             .font(.caption2).foregroundStyle(.secondary)
                     }
