@@ -570,11 +570,17 @@ final class BusAnnotation: NSObject, MKAnnotation {
         }
     }
 
+    // BusAnnotation.swift
     private func setSubtitle(_ s: String?) {
-        willChangeValue(forKey: "subtitle")
-        subtitleStorage = s
-        didChangeValue(forKey: "subtitle")
+        // CRASH FIX: subtitle KVO를 다음 런루프로 미뤄서 MapKit 내부 열거와 충돌 방지
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.willChangeValue(forKey: "subtitle")
+            self.subtitleStorage = s
+            self.didChangeValue(forKey: "subtitle")
+        }
     }
+
 
     func update(to b: BusLive) {
         // 값 갱신
@@ -2078,12 +2084,12 @@ final class MapVM: ObservableObject {
     func onRegionCommitted(_ region: MKCoordinateRegion) {
         regionTask?.cancel()
         regionTask = Task { [weak self] in
-            try? await Task.sleep(nanoseconds: 150_000_000) // 0.15s
+            // CRASH FIX: MapKit 내부 열거 타이밍과 경합 줄이기 (0.28s)
+            try? await Task.sleep(nanoseconds: 280_000_000)
             guard let self else { return }
             if self.shouldReload(for: region) {
                 self.lastRegion = region
                 self.lastReloadAt = Date()
-                // 최신 요청만 유지
                 self.reloadTask?.cancel()
                 self.reloadTask = Task { [weak self] in
                     await self?.reload(center: region.center)
@@ -2091,6 +2097,7 @@ final class MapVM: ObservableObject {
             }
         }
     }
+
 
     // MapVM 안에 추가
     private func nearestStops(from center: CLLocationCoordinate2D,
@@ -2407,10 +2414,10 @@ final class MapVM: ObservableObject {
         let PASS_GATE_M: Double   = 18
         let SPEED_FLOOR_MPS: Double = 1.5
         let NEAR_STOP_M: Double   = 25
-        let MAX_STEP_M: Double    = 300
+        let MAX_STEP_M: Double    = 700
         let EMA_ALPHA: Double     = 0.35
-        let MAX_PLAUSIBLE_MPS: Double = 40.0
-        let FOLLOW_STEP_ALLOW_METERS: CLLocationDistance = 1200
+        let MAX_PLAUSIBLE_MPS: Double = 50.0
+        let FOLLOW_STEP_ALLOW_METERS: CLLocationDistance = 2000
 
         for var b in incoming {
             let now = Date()
@@ -3009,6 +3016,7 @@ struct ClusteredMapView: UIViewRepresentable {
             if isApplyingDiff { return }
             isApplyingDiff = true
 
+            // 1단계: add/remove 만 (동일 런루프)
             DispatchQueue.main.async { [weak self, weak mapView] in
                 guard let self, let mapView else { return }
 
@@ -3018,7 +3026,6 @@ struct ClusteredMapView: UIViewRepresentable {
                 let selectedIds = Set(mapView.selectedAnnotations.compactMap { ($0 as? BusAnnotation)?.id })
 
                 let safeStopsToRemove = stopsToRemove.filter { present.contains(ObjectIdentifier($0)) }
-
                 let safeBusesToRemove: [MKAnnotation] = busesToRemove.compactMap { a in
                     guard present.contains(ObjectIdentifier(a)) else { return nil }
                     guard let b = a as? BusAnnotation else { return a }
@@ -3031,39 +3038,86 @@ struct ClusteredMapView: UIViewRepresentable {
                 UIView.performWithoutAnimation {
                     CATransaction.begin()
                     CATransaction.setDisableActions(true)
-
                     if !safeStopsToRemove.isEmpty || !safeBusesToRemove.isEmpty {
                         mapView.removeAnnotations(safeStopsToRemove + safeBusesToRemove)
                     }
                     if !stopsToAdd.isEmpty || !busesToAdd.isEmpty {
                         mapView.addAnnotations(stopsToAdd + busesToAdd)
                     }
-
                     CATransaction.commit()
                 }
 
-                if !busUpdates.isEmpty {
-                    CATransaction.begin()
-                    CATransaction.setAnimationDuration(0.9)
-                    for (anno, live) in busUpdates {
-                        anno.update(to: live)
-                        if let mv = mapView.view(for: anno) as? BusMarkerView {
-                            mv.updateAlwaysOnBubble()
+                // 2단계: 다음 런루프에서 뷰 접근/업데이트 (안전 시점)
+                DispatchQueue.main.async { [weak self, weak mapView] in
+                    guard let self, let mapView else { return }
+
+                    if !busUpdates.isEmpty {
+                        CATransaction.begin()
+                        CATransaction.setAnimationDuration(0.9)
+                        for (anno, live) in busUpdates {
+                            anno.update(to: live) // 좌표/자막 갱신 (setSubtitle가 async-KVO)
+                            if let mv = mapView.view(for: anno) as? BusMarkerView {
+                                mv.updateAlwaysOnBubble()
+                            }
                         }
+                        CATransaction.commit()
                     }
-                    CATransaction.commit()
+
+                    // 배치 후 후처리(모두 이 시점에서만)
+                    self.updateFollowTints(mapView)
+                    self.recolorStops(mapView)
+                    self.safeDeconflictAll(mapView) // ⬅️ 새 메서드 (아래 4번)
+
+                    self.isApplyingDiff = false
                 }
-
-                mapView.setNeedsLayout()
-                mapView.layoutIfNeeded()
-                self.isApplyingDiff = false
-
-                // ✅ 배치 후 팔로우/정류장 색상 안전망
-                self.updateFollowTints(mapView)
-                self.recolorStops(mapView)   // ← 아래 2) 추가 메서드
             }
         }
+        
         // ClusteredMapView.Coord
+        func safeDeconflictAll(_ mapView: MKMapView) {
+            // CRASH FIX: 배치가 끝난 “다음” 런루프에서 일괄 처리
+            DispatchQueue.main.async {
+                let buses = mapView.annotations.compactMap { $0 as? BusAnnotation }
+                let stops = mapView.annotations.compactMap { $0 as? BusStopAnnotation }
+
+                for bus in buses {
+                    guard let v = mapView.view(for: bus) else { continue }
+                    let defaultOffset = CGPoint(x: 0, y: -10)
+
+                    // 가장 가까운 정류장만 검사
+                    guard let nearest = stops.min(by: { lhs, rhs in
+                        let dl = CLLocation(latitude: lhs.coordinate.latitude, longitude: lhs.coordinate.longitude)
+                            .distance(from: CLLocation(latitude: bus.coordinate.latitude, longitude: bus.coordinate.longitude))
+                        let dr = CLLocation(latitude: rhs.coordinate.latitude, longitude: rhs.coordinate.longitude)
+                            .distance(from: CLLocation(latitude: bus.coordinate.latitude, longitude: bus.coordinate.longitude))
+                        return dl < dr
+                    }) else {
+                        (v as? MKAnnotationView)?.centerOffset = defaultOffset
+                        continue
+                    }
+
+                    let dist = CLLocation(latitude: nearest.coordinate.latitude, longitude: nearest.coordinate.longitude)
+                        .distance(from: CLLocation(latitude: bus.coordinate.latitude, longitude: bus.coordinate.longitude))
+
+                    let threshold: CLLocationDistance = 8.0
+                    guard dist <= threshold else {
+                        (v as? MKAnnotationView)?.centerOffset = defaultOffset
+                        continue
+                    }
+
+                    let dx = bus.coordinate.longitude - nearest.coordinate.longitude
+                    let dy = bus.coordinate.latitude  - nearest.coordinate.latitude
+                    let mag = max(1e-9, sqrt(dx*dx + dy*dy))
+                    let bump: CGFloat = 6.0
+                    let px = CGFloat(dx / mag) * bump
+                    let py = CGFloat(-dy / mag) * bump
+
+                    (v as? MKAnnotationView)?.centerOffset = CGPoint(x: defaultOffset.x + px, y: defaultOffset.y + py)
+                }
+            }
+        }
+
+
         
 
 
@@ -3091,50 +3145,34 @@ struct ClusteredMapView: UIViewRepresentable {
         // ClusteredMapView.Coord
         func mapView(_ mapView: MKMapView, viewFor annotation: MKAnnotation) -> MKAnnotationView? {
             if let s = annotation as? BusStopAnnotation {
-                    let v = mapView.dequeueReusableAnnotationView(withIdentifier: "stop", for: s) as! MKMarkerAnnotationView
-                    v.clusteringIdentifier = "stop"
-                    v.glyphText = "🚏"
-
-                    // ▶ 다음 정류장만 노란색, 나머지는 빨강
-                    v.markerTintColor = (parent.vm.highlightedStopId == s.stop.id) ? .systemYellow : .systemRed
-
-                    v.titleVisibility = .visible
-                    v.subtitleVisibility = .hidden
-                    v.displayPriority = .required
-                    v.layer.zPosition = 100
-                    return v
-
-            } else if let b = annotation as? BusAnnotation {
-                let v = mapView.dequeueReusableAnnotationView(withIdentifier: "bus", for: b) as! BusMarkerView
-
-                let isFollowed = (parent.vm.followBusId == b.id)
-
-                // ❗️nil 쓰지 말고, 팔로우 중이면 고유 ID로(클러스터에 안 빨려들게)
-                v.clusteringIdentifier = isFollowed ? "bus-\(b.id)" : "bus"
-
-                v.configureTint(isFollowed: isFollowed)
-
-                // ✅ 버스도 정류소와 '동급' 레벨
+                let v = mapView.dequeueReusableAnnotationView(withIdentifier: "stop", for: s) as! MKMarkerAnnotationView
+                v.clusteringIdentifier = "stop"
+                v.glyphText = "🚏"
+                v.markerTintColor = (parent.vm.highlightedStopId == s.stop.id) ? .systemYellow : .systemRed
+                v.titleVisibility = .visible
+                v.subtitleVisibility = .hidden
                 v.displayPriority = .required
                 v.layer.zPosition = 100
-
-                // 콜아웃 버튼(토글)
+                return v
+            } else if let b = annotation as? BusAnnotation {
+                let v = mapView.dequeueReusableAnnotationView(withIdentifier: "bus", for: b) as! BusMarkerView
+                let isFollowed = (parent.vm.followBusId == b.id)
+                v.clusteringIdentifier = isFollowed ? "bus-\(b.id)" : "bus" // 클러스터 예외
+                v.configureTint(isFollowed: isFollowed)
+                v.displayPriority = .required
+                v.layer.zPosition = 100
                 v.canShowCallout = true
                 let btn = UIButton(type: .system)
                 btn.setTitle(isFollowed ? "해제" : "추적", for: .normal)
                 btn.titleLabel?.font = .systemFont(ofSize: 14, weight: .semibold)
                 v.rightCalloutAccessoryView = btn
-
-                // 항상 보이는 말풍선(ETA/다음정류장) 업데이트
                 v.updateAlwaysOnBubble()
 
-                // ✅ 정류소와 겹치면 좌표는 그대로 두고 '뷰만' 살짝 비켜놓기
-                applyVisualDeconflictIfNearStop(mapView, view: v, bus: b)
+                // CRASH FIX: 여기서 다른 annotation에 접근/열거 금지
+                // (겹침 해소는 배치 후 safeDeconflictAll에서 수행)
 
                 return v
-
             } else if let cluster = annotation as? MKClusterAnnotation {
-                // 클러스터는 한 단계 낮게(동등 3요소와 겹치지 않도록)
                 let cv = mapView.dequeueReusableAnnotationView(
                     withIdentifier: MKMapViewDefaultClusterAnnotationViewReuseIdentifier,
                     for: cluster
@@ -3142,7 +3180,6 @@ struct ClusteredMapView: UIViewRepresentable {
                 cv.layer.zPosition = 80
                 return cv
             }
-
             return nil
         }
 
@@ -3312,11 +3349,12 @@ struct ClusteredMapView: UIViewRepresentable {
         // 지도가 움직였을 때: 사용자 제스처가 아니더라도, 팔로우 중이면 주기적으로 정류장 재로딩
         // ClusteredMapView.Coord
         func mapView(_ mapView: MKMapView, regionDidChangeAnimated animated: Bool) {
-            deb.call(after: 0.25) {
-                // ✅ 제스처/자동/팔로우 상관없이 항상 통지
+            // CRASH FIX: 내부 열거 직후 연쇄 호출 경합 완화 (0.30s)
+            deb.call(after: 0.30) {
                 self.parent.vm.onRegionCommitted(mapView.region)
             }
         }
+
         
         
         // rendererFor overlay
