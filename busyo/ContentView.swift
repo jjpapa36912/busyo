@@ -3498,6 +3498,7 @@ struct BusMapScreen: View {
                 }
 
             // 내 위치 버튼
+            // 내 위치 버튼
             Button {
                 loc.requestWhenInUse()
                 recenterRequest = true
@@ -3509,9 +3510,10 @@ struct BusMapScreen: View {
                     .clipShape(Circle())
                     .shadow(radius: 3)
             }
-            .padding(.bottom, 24)
-            .padding(.trailing, 16)
-            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomTrailing)
+            .padding(.top, 24)        // 🔼 상단 여백
+            .padding(.trailing, 16)   // 🔼 오른쪽 여백
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing) // ⬅️ 상단 우측 고정
+
         }
         // 고정 “추적 중” 배지
         .overlay(alignment: .topLeading) {
