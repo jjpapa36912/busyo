@@ -531,7 +531,7 @@ final class BusAPI: NSObject, URLSessionDelegate {
 final class BusStopAnnotation: NSObject, MKAnnotation {
     let stop: BusStop
     @objc dynamic var coordinate: CLLocationCoordinate2D
-    
+
     var title: String? { stop.name }
     init(_ s: BusStop) { self.stop = s; self.coordinate = .init(latitude: s.lat, longitude: s.lon) }
 }
@@ -855,7 +855,33 @@ final class MapVM: ObservableObject {
     // MapVM 클래스 맨 위 @Published 모음 근처에 추가
     @Published var stickToFollowedBus: Bool = false   // 팔로우 시 자동 재센터링 여부 (기본: 꺼짐)
 
-    
+    // ✅ 선택된 정류장 영속 저장
+       @Published private(set) var selectedStopIds: Set<String> = []
+       private let selectedStopsKey = "busyo.selectedStopIds"
+
+       init() {
+           loadSelectedStops()
+       }
+
+       private func loadSelectedStops() {
+           if let arr = UserDefaults.standard.array(forKey: selectedStopsKey) as? [String] {
+               selectedStopIds = Set(arr)
+           }
+       }
+
+       private func persistSelectedStops() {
+           UserDefaults.standard.set(Array(selectedStopIds), forKey: selectedStopsKey)
+       }
+
+       func isStopSelected(_ id: String) -> Bool { selectedStopIds.contains(id) }
+
+       func toggleStopSelection(_ id: String) {
+           if selectedStopIds.contains(id) { selectedStopIds.remove(id) }
+           else { selectedStopIds.insert(id) }
+           persistSelectedStops()
+           // 지도(주석 색상) 반영될 수 있도록 퍼블리시
+           objectWillChange.send()
+       }
     // MapVM 안에 추가
     private var lastETA: [String: (eta: Int, at: Date)] = [:]
     // MapVM 프로퍼티 (캐시)
@@ -2856,6 +2882,10 @@ private extension MKMapView {
 struct ClusteredMapView: UIViewRepresentable {
     @ObservedObject var vm: MapVM
     @Binding var recenterRequest: Bool
+    
+    // ✅ 추가: 콜백
+       var onAskAlarmForStop: ((BusStop) -> Void)? = nil
+       var onToggleSelectStop: ((BusStop) -> Void)? = nil
 
     func makeUIView(context: Context) -> MKMapView {
         let map = MKMapView(frame: .zero)
@@ -3191,14 +3221,47 @@ struct ClusteredMapView: UIViewRepresentable {
         // ClusteredMapView.Coord
         func mapView(_ mapView: MKMapView, viewFor annotation: MKAnnotation) -> MKAnnotationView? {
             if let s = annotation as? BusStopAnnotation {
+                print("▶ STOP CALLOUT TAPPED:")  // 🔍 꼭 찍히는지 확인
+
                 let v = mapView.dequeueReusableAnnotationView(withIdentifier: "stop", for: s) as! MKMarkerAnnotationView
-                v.clusteringIdentifier = "stop"
+                v.canShowCallout = true          // ✅ 이게 빠져서 버튼이 안 보였던 것
+
+                v.clusteringIdentifier = nil
                 v.glyphText = "🚏"
-                v.markerTintColor = (parent.vm.highlightedStopId == s.stop.id) ? .systemYellow : .systemRed
                 v.titleVisibility = .visible
                 v.subtitleVisibility = .hidden
                 v.displayPriority = .required
                 v.layer.zPosition = 100
+
+              
+                
+                // === ✅ 왼쪽 액세서리: 아이콘 + 접근성 라벨 ===
+                let left = UIButton(type: .system)
+                let selected = parent.vm.isStopSelected(s.stop.id)
+                left.setImage(UIImage(systemName: selected ? "checkmark.circle.fill" : "circle"), for: .normal)
+                left.accessibilityLabel = selected ? "선택해제" : "선택"
+                left.tintColor = .label
+                left.contentEdgeInsets = UIEdgeInsets(top: 6, left: 6, bottom: 6, right: 6)
+                left.sizeToFit()                               // ✅ 크기 확보
+                v.leftCalloutAccessoryView = left
+
+                // === ✅ 오른쪽 액세서리: 종 아이콘(텍스트보다 안전) ===
+                let right = UIButton(type: .system)
+                right.setImage(UIImage(systemName: "bell.badge.fill"), for: .normal)
+                right.accessibilityLabel = "알람"
+                right.tintColor = .label
+                right.contentEdgeInsets = UIEdgeInsets(top: 6, left: 6, bottom: 6, right: 6)
+                right.sizeToFit()                              // ✅ 크기 확보
+                v.rightCalloutAccessoryView = right
+
+                // 색상: 하이라이트(노랑) > 내가 고정한 정류장(주황) > 일반(빨강)
+                if parent.vm.highlightedStopId == s.stop.id {
+                    v.markerTintColor = .systemYellow
+                } else if selected {
+                    v.markerTintColor = .systemOrange
+                } else {
+                    v.markerTintColor = .systemRed
+                }
                 return v
             } else if let b = annotation as? BusAnnotation {
                 let v = mapView.dequeueReusableAnnotationView(withIdentifier: "bus", for: b) as! BusMarkerView
@@ -3350,45 +3413,60 @@ struct ClusteredMapView: UIViewRepresentable {
         func mapView(_ mapView: MKMapView,
                      annotationView view: MKAnnotationView,
                      calloutAccessoryControlTapped control: UIControl) {
-            guard let bus = view.annotation as? BusAnnotation else { return }
+//            guard let bus = view.annotation as? BusAnnotation else { return }
 
-            if parent.vm.followBusId == bus.id {
-                // ▶ 팔로우 해제
-                parent.vm.followBusId = nil
-                mapView.deselectAnnotation(bus, animated: true)
-                if let mv = view as? BusMarkerView { mv.configureTint(isFollowed: false) }
-                if let mv = view as? BusMarkerView, let btn = mv.rightCalloutAccessoryView as? UIButton {
-                    btn.setTitle("추적", for: .normal)
+            // ① 버스: 기존 로직 유지
+                if let bus = view.annotation as? BusAnnotation {
+                    if parent.vm.followBusId == bus.id {
+                        parent.vm.followBusId = nil
+                        mapView.deselectAnnotation(bus, animated: true)
+                        if let mv = view as? BusMarkerView { mv.configureTint(isFollowed: false) }
+                        if let mv = view as? BusMarkerView, let btn = mv.rightCalloutAccessoryView as? UIButton {
+                            btn.setTitle("추적", for: .normal)
+                        }
+                        parent.vm.stopTrail()
+                        parent.vm.clearFutureRoute()
+                        self.updateFutureRouteOverlay(mapView)
+                        parent.vm.highlightedStopId = nil
+                    } else {
+                        parent.vm.followBusId = bus.id
+                        if parent.vm.stickToFollowedBus { follow(bus, on: mapView) }
+                        if let mv = view as? BusMarkerView { mv.configureTint(isFollowed: true); mv.updateAlwaysOnBubble() }
+                        if let mv = view as? BusMarkerView, let btn = mv.rightCalloutAccessoryView as? UIButton {
+                            btn.setTitle("해제", for: .normal)
+                        }
+                        parent.vm.startTrail(for: bus.id, seed: bus.coordinate)
+                        DispatchQueue.main.async { [weak self, weak mapView] in
+                            guard let self, let mapView else { return }
+                            self.updateFollowTints(mapView)
+                        }
+                    }
+                    return
                 }
+            
+            // ② 정류장: 선택/알람 처리
+               if let stop = view.annotation as? BusStopAnnotation {
+                   print("▶▶▶▶ stop callout tapped", stop.stop.name)   // 🔍 로그
 
-                // ✅ 트레일 종료
-                parent.vm.stopTrail()
-                parent.vm.clearFutureRoute()          // ✅ 미래 경로 지우기
-                    self.updateFutureRouteOverlay(mapView)
+                   // calloutAccessoryControlTapped 안, stop 분기 내
+                   if control === view.leftCalloutAccessoryView {
+                       parent.onToggleSelectStop?(stop.stop)
+                       if let marker = mapView.view(for: stop) as? MKMarkerAnnotationView {
+                           let selected = parent.vm.isStopSelected(stop.stop.id)
+                           marker.markerTintColor = selected ? .systemOrange : .systemRed
+                           if let leftBtn = marker.leftCalloutAccessoryView as? UIButton {
+                               leftBtn.setImage(UIImage(systemName: selected ? "checkmark.circle.fill" : "circle"), for: .normal)
+                               leftBtn.accessibilityLabel = selected ? "선택해제" : "선택"
+                               leftBtn.sizeToFit()
+                           }
+                       }
+                   } else if control === view.rightCalloutAccessoryView {
+                       parent.onAskAlarmForStop?(stop.stop)
+                   }
 
-                // (선택) 하이라이트 정류장 초기화
-                parent.vm.highlightedStopId = nil
-
-            } else {
-                // ▶ 팔로우 시작
-                parent.vm.followBusId = bus.id
-                if parent.vm.stickToFollowedBus {
-                    follow(bus, on: mapView)
-                }
-                if let mv = view as? BusMarkerView { mv.configureTint(isFollowed: true); mv.updateAlwaysOnBubble() }
-                if let mv = view as? BusMarkerView, let btn = mv.rightCalloutAccessoryView as? UIButton {
-                    btn.setTitle("해제", for: .normal)
-                }
-
-                // ✅ 트레일 시작
-                parent.vm.startTrail(for: bus.id, seed: bus.coordinate)
-
-                // (선택) 바로 정류장 하이라이트 갱신 안전망
-                DispatchQueue.main.async { [weak self, weak mapView] in
-                    guard let self, let mapView else { return }
-                    self.updateFollowTints(mapView)
-                }
-            }
+                   return
+               }
+            
         }
 
 
@@ -3440,9 +3518,18 @@ struct ClusteredMapView: UIViewRepresentable {
             for a in mapView.annotations {
                 guard let s = a as? BusStopAnnotation,
                       let v = mapView.view(for: s) as? MKMarkerAnnotationView else { continue }
-                v.markerTintColor = (s.stop.id == targetId) ? .systemYellow : .systemRed
+                if parent.vm.isStopSelected(s.stop.id) {
+                    v.markerTintColor = .systemOrange
+                } else {
+                    v.markerTintColor = (s.stop.id == targetId) ? .systemYellow : .systemRed
+                }
+                // 왼쪽 버튼 라벨도 동기화
+                if let btn = v.leftCalloutAccessoryView as? UIButton {
+                    btn.setTitle(parent.vm.isStopSelected(s.stop.id) ? "선택해제" : "선택", for: .normal)
+                }
             }
         }
+
 
 
 
@@ -3488,9 +3575,25 @@ struct BusMapScreen: View {
     @State private var debugText = ""
         @State private var bannerMounted = false
         @StateObject private var banner = BannerAdController()
+    
+    // ✅ 알람 시트 상태
+       @State private var showAlarmSheet = false
+       @State private var alarmTargetStop: BusStop? = nil
+
+       // 시트에 넘길 기본값
+       @State private var alarmDate: Date = Date().addingTimeInterval(5*60)
+       @State private var repeatMinutesText: String = ""
+    
     var body: some View {
         ZStack {
-            ClusteredMapView(vm: vm, recenterRequest: $recenterRequest)
+            ClusteredMapView(vm: vm, recenterRequest: $recenterRequest,
+                             onAskAlarmForStop: { stop in
+                                 alarmTargetStop = stop
+                                 showAlarmSheet = true
+                             },
+                             onToggleSelectStop: { stop in
+                                 vm.toggleStopSelection(stop.id)
+                             })
                 .ignoresSafeArea()
                 .task {
                     loc.requestWhenInUse()
@@ -3565,6 +3668,56 @@ struct BusMapScreen: View {
                 .padding(.bottom, 8)
                 .animation(.easeInOut(duration: 0.2), value: showBanner)
                 }
+        
+        // ✅ 알람 설정 시트
+                .sheet(isPresented: $showAlarmSheet) {
+                    VStack(alignment: .leading, spacing: 16) {
+                        Text("정류장 알림").font(.title3).bold()
+                        if let s = alarmTargetStop {
+                            Text("정류장: \(s.name)").font(.subheadline)
+                        }
+
+                        Group {
+                            Text("특정 시각에 한 번 울리기").font(.footnote).foregroundStyle(.secondary)
+                            DatePicker("시간", selection: $alarmDate, displayedComponents: [.hourAndMinute, .date])
+                        }
+
+                        Divider()
+
+                        Group {
+                            Text("반복 알림 (분 단위)").font(.footnote).foregroundStyle(.secondary)
+                            HStack {
+                                TextField("예: 10", text: $repeatMinutesText)
+                                    .keyboardType(.numberPad)
+                                    .textFieldStyle(.roundedBorder)
+                                Text("분마다")
+                            }
+                        }
+
+                        HStack {
+                            Button("닫기") { showAlarmSheet = false }
+                            Spacer()
+                            Button("저장") {
+                                Task {
+                                    guard let s = alarmTargetStop else { return }
+                                    let ok = await LocalAlertCenter.shared.requestPermissionIfNeeded()
+                                    guard ok else { return }
+                                    if let m = Int(repeatMinutesText), m >= 1 {
+                                        LocalAlertCenter.shared.scheduleRepeating(stop: s, routes: nil, every: m)
+                                    } else {
+                                        LocalAlertCenter.shared.scheduleOneTime(stop: s, routes: nil, at: alarmDate)
+                                    }
+                                    showAlarmSheet = false
+                                }
+                            }
+                            .buttonStyle(.borderedProminent)
+                        }
+                    }
+                    .padding()
+                    .presentationDetents([.height(360), .medium])
+                }
+        
+        
     }
 }
 /// JSON에서 item이 단일 객체이든 배열이든 모두 수용
@@ -3838,5 +3991,57 @@ private struct UpcomingPanelContent: View {
         .onChange(of: items.map(\.id).joined(separator: "|")) { _ in
             vm.redrawFutureRouteFromUpcoming(busId: fid, maxCount: 7)
         }
+    }
+}
+import UserNotifications
+
+final class LocalAlertCenter {
+    static let shared = LocalAlertCenter()
+    private init() {}
+
+    func requestPermissionIfNeeded() async -> Bool {
+        let center = UNUserNotificationCenter.current()
+        let settings = await center.notificationSettings()
+        if settings.authorizationStatus == .authorized { return true }
+        do {
+            let ok = try await center.requestAuthorization(options: [.alert, .sound, .badge])
+            return ok
+        } catch { return false }
+    }
+
+    // 단발 알람 (특정 시각)
+    func scheduleOneTime(stop: BusStop, routes: [String]?, at date: Date) {
+        let content = UNMutableNotificationContent()
+        content.title = "🚌 \(stop.name)"
+        if let rs = routes, !rs.isEmpty {
+            content.body = "도착 확인 알림 • 노선: \(rs.joined(separator: ", "))"
+        } else {
+            content.body = "도착 확인 알림"
+        }
+        content.sound = .default
+
+        let comps = Calendar.current.dateComponents([.year,.month,.day,.hour,.minute], from: date)
+        let trigger = UNCalendarNotificationTrigger(dateMatching: comps, repeats: false)
+        let id = "one-\(stop.id)-\(UUID().uuidString)"
+        let req = UNNotificationRequest(identifier: id, content: content, trigger: trigger)
+        UNUserNotificationCenter.current().add(req)
+    }
+
+    // 반복 알람 (분 단위 주기)
+    func scheduleRepeating(stop: BusStop, routes: [String]?, every minutes: Int) {
+        let content = UNMutableNotificationContent()
+        content.title = "🚌 \(stop.name)"
+        if let rs = routes, !rs.isEmpty {
+            content.body = "주기적 알림 • 노선: \(rs.joined(separator: ", "))"
+        } else {
+            content.body = "주기적 알림"
+        }
+        content.sound = .default
+
+        let interval = max(60, minutes * 60)
+        let trigger = UNTimeIntervalNotificationTrigger(timeInterval: TimeInterval(interval), repeats: true)
+        let id = "rep-\(stop.id)-\(minutes)m"
+        let req = UNNotificationRequest(identifier: id, content: content, trigger: trigger)
+        UNUserNotificationCenter.current().add(req)
     }
 }
