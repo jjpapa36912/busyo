@@ -3028,17 +3028,19 @@ struct ClusteredMapView: UIViewRepresentable {
         map.delegate = context.coordinator
         map.showsUserLocation = true
 
-        // ✅ 내 위치 가능하면 그걸로 시작, 아니면 대전 기본값
-        let lm = CLLocationManager()
-        let startCenter: CLLocationCoordinate2D =
-            lm.location?.coordinate ?? CLLocationCoordinate2D(latitude: 36.351, longitude: 127.385)
+        // ✅ 무조건 대전 시청에서 시작
+        let startCenter = CLLocationCoordinate2D(latitude: 36.351, longitude: 127.385)
 
-        map.region = .init(center: startCenter,
-                           span: .init(latitudeDelta: 0.045, longitudeDelta: 0.045))
+        map.region = MKCoordinateRegion(
+            center: startCenter,
+            span: MKCoordinateSpan(latitudeDelta: 0.045, longitudeDelta: 0.045)
+        )
         map.pointOfInterestFilter = .includingAll
         map.register(MKMarkerAnnotationView.self, forAnnotationViewWithReuseIdentifier: "stop")
         map.register(BusMarkerView.self, forAnnotationViewWithReuseIdentifier: "bus")
-        map.register(ClusterView.self, forAnnotationViewWithReuseIdentifier: MKMapViewDefaultClusterAnnotationViewReuseIdentifier)
+        map.register(ClusterView.self,
+                     forAnnotationViewWithReuseIdentifier: MKMapViewDefaultClusterAnnotationViewReuseIdentifier)
+
         return map
     }
 
