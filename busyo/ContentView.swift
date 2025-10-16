@@ -490,15 +490,14 @@ final class BusAPI: NSObject, URLSessionDelegate {
                 .init(name: "pageNo", value: "1"),
                 .init(name: "numOfRows", value: "200"),
                 .init(name: "_type", value: "json"),
-                .init(name: "type", value: "json"),
                 .init(name: "cityCode", value: String(cityCode)),
                 .init(name: "routeId", value: routeId)
             ])
 
+        // ⬇️ 여기 Root를 ItemsFlex로 교체
         struct Root: Decodable {
             struct Resp: Decodable { let body: Body? }
-            struct Body: Decodable { let items: Items? }
-            struct Items: Decodable { let item: [Item]? }
+            struct Body: Decodable { let items: ItemsFlex<Item>? }  // ✅ 핵심 변경
             struct Item: Decodable {
                 let vehicleno: String
                 let routenm: FlexString?
@@ -506,22 +505,29 @@ final class BusAPI: NSObject, URLSessionDelegate {
                 let gpsLati: FlexDouble?
                 let gpsLong: FlexDouble?
                 let nodenm: FlexString?
-                enum CodingKeys: String, CodingKey { case vehicleno, routenm, routeno, gpsLati, gpsLong, gpslati, gpslong, nodenm }
+                enum CodingKeys: String, CodingKey {
+                    case vehicleno, routenm, routeno, gpsLati, gpsLong, gpslati, gpslong, nodenm
+                }
                 init(from d: Decoder) throws {
                     let c = try d.container(keyedBy: CodingKeys.self)
                     vehicleno = try c.decode(String.self, forKey: .vehicleno)
                     routenm   = try? c.decode(FlexString.self, forKey: .routenm)
                     routeno   = try? c.decode(FlexString.self, forKey: .routeno)
-                    gpsLati   = (try? c.decode(FlexDouble.self, forKey: .gpsLati)) ?? (try? c.decode(FlexDouble.self, forKey: .gpslati))
-                    gpsLong   = (try? c.decode(FlexDouble.self, forKey: .gpsLong)) ?? (try? c.decode(FlexDouble.self, forKey: .gpslong))
+                    gpsLati   = (try? c.decode(FlexDouble.self, forKey: .gpsLati))
+                             ?? (try? c.decode(FlexDouble.self, forKey: .gpslati))
+                    gpsLong   = (try? c.decode(FlexDouble.self, forKey: .gpsLong))
+                             ?? (try? c.decode(FlexDouble.self, forKey: .gpslong))
                     nodenm    = try? c.decode(FlexString.self, forKey: .nodenm)
                 }
             }
             let response: Resp?
         }
 
-        let (data, _) = try await send("BusLoc", url: url)
-        if isLikelyXML(data) {
+        let (data, resp) = try await send("BusLoc", url: url)
+        let fmt = sniffFormat(data: data, resp: resp)
+
+        switch fmt {
+        case .xml:
             let arr = try parseXMLItems(data)
             return arr.compactMap { d in
                 guard let veh = d["vehicleno"],
@@ -530,9 +536,12 @@ final class BusAPI: NSObject, URLSessionDelegate {
                       let lo = toDouble(d["gpslong"]) ?? toDouble(d["gpsLong"]) else { return nil }
                 return BusLive(id: veh, routeNo: r, lat: la, lon: lo, etaMinutes: nil, nextStopName: d["nodenm"])
             }
-        } else {
-            let r = try JSONDecoder().decode(Root.self, from: data)
-            return (r.response?.body?.items?.item ?? []).compactMap {
+
+        case .json:
+            // ⬇️ 여기도 ItemsFlex 기반으로 안전하게 꺼내기
+            let r = try decodeJSON(Root.self, from: data, name: "BusLoc")
+            let items = r.response?.body?.items?.values ?? []   // ✅ 단일/배열 모두 커버
+            return items.compactMap {
                 guard let la = $0.gpsLati?.value, let lo = $0.gpsLong?.value else { return nil }
                 return BusLive(
                     id: $0.vehicleno,
@@ -542,7 +551,63 @@ final class BusAPI: NSObject, URLSessionDelegate {
                     nextStopName: $0.nodenm?.value
                 )
             }
+
+        default:
+            print("❌ [BusLoc] unexpected body: \(peek(data))")
+            throw APIError.decode(NSError(domain: "BusLoc", code: -2,
+                                          userInfo: [NSLocalizedDescriptionKey: "BusLoc returned non-JSON: \(peek(data))"]))
         }
+    }
+    private enum WireFormat { case json, xml, text, unknown }
+
+    // HTTP 헤더 값 얻기(대/소문자 무시)
+    private func header(_ resp: HTTPURLResponse, _ name: String) -> String? {
+        for (k, v) in resp.allHeaderFields {
+            if String(describing: k).lowercased() == name.lowercased() {
+                return String(describing: v)
+            }
+        }
+        return nil
+    }
+
+    // 응답 포맷 스니핑
+    private func sniffFormat(data: Data, resp: HTTPURLResponse) -> WireFormat {
+        if let ct = header(resp, "Content-Type")?.lowercased() {
+            if ct.contains("json") { return .json }
+            if ct.contains("xml")  { return .xml }
+            if ct.contains("html") || ct.contains("text") { return .text }
+        }
+        guard let s0 = String(data: data, encoding: .utf8)?
+                .trimmingCharacters(in: .whitespacesAndNewlines) else { return .unknown }
+        if s0.hasPrefix("{") || s0.hasPrefix("[") { return .json }
+        if s0.hasPrefix("<") || s0.lowercased().hasPrefix("<?xml") { return .xml }
+        if s0.lowercased().hasPrefix("forbidden")
+            || s0.lowercased().contains("service key")
+            || s0.lowercased().contains("unauthorized")
+            || s0.lowercased().contains("인증") { return .text }
+        return .unknown
+    }
+
+    // 응답 앞부분 미리보기(로그용)
+    private func peek(_ data: Data, limit: Int = 300) -> String {
+        let s = String(data: data, encoding: .utf8) ?? "<non-utf8 bytes: \(data.count)b>"
+        return String(s.prefix(limit)).replacingOccurrences(of: "\n", with: " ")
+    }
+
+    // JSON 디코딩(실패 시 원문 피크 로그)
+    private func decodeJSON<T: Decodable>(_ type: T.Type, from data: Data, name: String) throws -> T {
+        do { return try JSONDecoder().decode(T.self, from: data) }
+        catch {
+            print("❌ [\(name)] JSON decode failed. peek=\(peek(data))")
+            throw APIError.decode(error as NSError)
+        }
+    }
+
+    // 서비스 키 마스킹(로그용) — 없으면 추가
+    private func maskKey(_ s: String) -> String {
+        guard s.count > 8 else { return "******" }
+        let head = s.prefix(4), tail = s.suffix(4)
+        return "\(head)****\(tail)"
     }
 }
 
@@ -1010,22 +1075,228 @@ final class MapVM: ObservableObject {
             return stops.first(where: { $0.id == id })
         }
 
-        func refreshFocusStopETA() async {
-            guard let s = focusStop else { return }
-            await MainActor.run { focusStopLoading = true }
-            // TODO: 실제 API/계산으로 교체
-            // 여기선 샘플로 routeNo들을 2~4개 랜덤 생성
-            let demos = [
-                ArrivalInfo(routeId: "1001", routeNo: "101", etaMinutes: Int.random(in: 1...7)),
-                ArrivalInfo(routeId: "1002", routeNo: "706", etaMinutes: Int.random(in: 3...15)),
-                ArrivalInfo(routeId: "1003", routeNo: "612", etaMinutes: Int.random(in: 2...20)),
-            ]
-            try? await Task.sleep(nanoseconds: 300_000_000)
-            await MainActor.run {
-                self.focusStopETAs = demos.sorted { $0.etaMinutes < $1.etaMinutes }
-                self.focusStopLoading = false
+    // MapVM.swift
+    @MainActor//
+    //  Notice.swift
+    //  busyo
+    //
+    //  Created by 김동준 on 10/14/25.
+    //
+
+
+    struct RemoteNotice: Codable, Equatable {
+        struct Body: Codable, Equatable {
+            let message: String
+            let level: String   // "info" | "warn" | "urgent"
+            let link: String?
+            let startAt: String?
+            let endAt: String?
+        }
+        let notice: Body?
+    }
+
+    @MainActor
+    final class NoticeCenter: ObservableObject {
+        static let shared = NoticeCenter()
+
+        @Published var notice: RemoteNotice.Body?
+        @Published var lastFetchError: String?
+        @Published var hideThisSession: Bool = false   // ← 이번 앱 실행 동안만 숨김
+
+        private let endpoint = URL(string: "http://13.124.208.108:1213/notice")!
+        private let etagKey = "notice.etag"
+        private var timer: Task<Void, Never>?
+
+        func startAutoRefresh() {
+            timer?.cancel()
+            timer = Task {
+                var wait: Double = 0 // 즉시 1회
+                while !Task.isCancelled {
+                    if wait > 0 { try? await Task.sleep(nanoseconds: UInt64(wait * 1_000_000_000)) }
+                    await fetchOnce()
+                    // 정상/304 → 10분, 에러 → 지수 백오프 상한 30분
+                    wait = (lastFetchError == nil) ? 600 : min((wait == 0 ? 30 : wait * 2), 1800)
+                }
             }
         }
+
+        func stopAutoRefresh() { timer?.cancel(); timer = nil }
+
+        /// 이번 앱 실행에서만 공지를 숨김 (앱 재시작 시 다시 보임)
+        func dismissForThisSession() {
+            hideThisSession = true
+        }
+
+        func fetchOnce() async {
+            var req = URLRequest(url: endpoint)
+            req.timeoutInterval = 8
+            if let etag = UserDefaults.standard.string(forKey: etagKey) {
+                req.setValue(etag, forHTTPHeaderField: "If-None-Match")
+            }
+
+            do {
+                let (data, resp) = try await URLSession.shared.data(for: req)
+                guard let http = resp as? HTTPURLResponse else { return }
+
+                if http.statusCode == 304 {
+                    // 변경 없음
+                    self.lastFetchError = nil
+                    return
+                }
+                guard http.statusCode == 200 else {
+                    self.lastFetchError = "HTTP \(http.statusCode)"
+                    // 실패 시에도 플레이스홀더로 표시
+                    self.notice = RemoteNotice.Body(message: "공지 없음", level: "info", link: nil, startAt: nil, endAt: nil)
+                    return
+                }
+
+                if let et = http.value(forHTTPHeaderField: "ETag") {
+                    UserDefaults.standard.set(et, forKey: etagKey)
+                }
+
+                let decoded = try JSONDecoder().decode(RemoteNotice.self, from: data)
+                // 기간 필터
+                self.notice = Self.validated(decoded.notice)
+                self.lastFetchError = nil
+
+                // 새로운 공지가 들어오면 이번 세션 숨김 해제(다시 보여주기)
+                self.hideThisSession = false
+
+            } catch {
+                self.lastFetchError = error.localizedDescription
+                // 네트워크 실패 → '공지 없음' 플레이스홀더
+                self.notice = RemoteNotice.Body(message: "공지 없음", level: "info", link: nil, startAt: nil, endAt: nil)
+            }
+        }
+
+        private static func validated(_ n: RemoteNotice.Body?) -> RemoteNotice.Body? {
+            guard let n else { return nil }
+            let iso = ISO8601DateFormatter()
+            let now = Date()
+            if let s = n.startAt, let d = iso.date(from: s), now < d { return nil }
+            if let e = n.endAt,   let d = iso.date(from: e), now > d { return nil }
+            return n
+        }
+    }
+
+
+
+    struct NoticeBarView: View {
+        @ObservedObject var center = NoticeCenter.shared
+
+        @State private var isExpanded: Bool = false
+        private let maxExpandedHeight: CGFloat = 160   // 펼쳤을 때 최대 높이(스크롤)
+
+        var body: some View {
+            if !center.hideThisSession, let n = center.notice {
+                HStack(alignment: .top, spacing: 10) {
+                    // 아이콘
+                    Image(systemName: n.message == "공지 없음"
+                          ? "info.circle"
+                          : (n.level == "urgent" ? "exclamationmark.triangle.fill"
+                            : n.level == "warn" ? "exclamationmark.circle.fill"
+                            : "megaphone.fill"))
+                        .font(.system(size: 14, weight: .bold))
+                        .padding(.top, 2)
+
+                    // 본문(접기/펼치기)
+                    VStack(alignment: .leading, spacing: 6) {
+                        if isExpanded {
+                            ScrollView(showsIndicators: true) {
+                                Text(n.message)
+                                    .font(.footnote).bold()
+                                    .textSelection(.enabled)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                    .padding(.trailing, 4)
+                            }
+                            .frame(maxHeight: maxExpandedHeight)
+                            .transition(.opacity)
+                        } else {
+                            Text(n.message)
+                                .font(.footnote).bold()
+                                .lineLimit(2)
+                                .transition(.opacity)
+                        }
+
+                        // 액션들 (플레이스홀더는 행동 버튼 숨김)
+                        if n.message != "공지 없음" {
+                            HStack(spacing: 8) {
+                                Button(isExpanded ? "접기" : "더보기") {
+                                    withAnimation(.easeInOut(duration: 0.2)) { isExpanded.toggle() }
+                                }
+                                .font(.caption2).bold()
+                                .buttonStyle(.bordered)
+    //
+    //                            if let link = n.link, let url = URL(string: link), !link.isEmpty {
+    //                                Button("열기") {
+    //                                    UIApplication.shared.open(url, options: [:], completionHandler: nil)
+    //                                }
+    //                                .font(.caption2).bold()
+    //                                .buttonStyle(.bordered)
+    //                            }
+
+                                Spacer(minLength: 8)
+                            }
+                            .padding(.top, 2)
+                        }
+                    }
+
+                    // 닫기(X) — 플레이스홀더일 땐 X 숨김(기존 정책 유지)
+                    if n.message != "공지 없음" {
+                        Button {
+                            withAnimation(.easeInOut(duration: 0.15)) {
+                                center.dismissForThisSession()  // 이번 앱 실행에서만 숨김
+                            }
+                        } label: {
+                            Image(systemName: "xmark")
+                        }
+                        .buttonStyle(.bordered)
+                        .accessibilityLabel("공지 닫기")
+                    }
+                }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 8)
+                .background(background(for: n), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                .foregroundStyle(.white)
+                .shadow(radius: 2)
+                .fixedSize(horizontal: false, vertical: true) // 줄바꿈 시 높이 자연 확장
+                .animation(.easeInOut(duration: 0.2), value: isExpanded)
+            }
+        }
+
+        private func background(for n: RemoteNotice.Body) -> Color {
+            if n.message == "공지 없음" { return .gray }
+            switch n.level {
+            case "urgent": return .red
+            case "warn":   return .orange
+            default:       return .blue
+            }
+        }
+    }
+
+    func refreshFocusStopETA() async {
+        guard let s = focusStop else { return }
+
+        focusStopLoading = true
+        defer { focusStopLoading = false }
+
+        do {
+            // 국토부 API 호출 (CITY_CODE = 25 대전)
+            let arr = try await api.fetchArrivalsDetailed(cityCode: CITY_CODE, nodeId: s.id)
+
+            // 보기 좋게 정렬 + 필요시 중복(routeId) 최소 ETA만 남기기
+            // (원하면 그대로 두고 단순 정렬만 해도 됩니다)
+            let bestByRouteId = Dictionary(grouping: arr, by: { $0.routeId })
+                .compactMapValues { $0.min(by: { $0.etaMinutes < $1.etaMinutes }) }
+            let sorted = Array(bestByRouteId.values).sorted { $0.etaMinutes < $1.etaMinutes }
+
+            self.focusStopETAs = sorted
+        } catch {
+            // 실패 시 빈 목록로 처리
+            self.focusStopETAs = []
+            print("❌ refreshFocusStopETA error: \(error)")
+        }
+    }
 
         // 알림 본문 요약
         func focusETACompactSummary() -> String {
@@ -2420,7 +2691,11 @@ final class MapVM: ObservableObject {
 
             // 3) 버스 위치
             let snap = makeRouteSnapshot()
-            let etaByRoute = Dictionary(uniqueKeysWithValues: top.map { ($0.routeNo, $0.etaMinutes) })
+            // 기존: let etaByRoute = Dictionary(uniqueKeysWithValues: top.map { ($0.routeNo, $0.etaMinutes) })
+
+            let etaByRoute: [String: Int] =
+                Dictionary(top.map { ($0.routeNo, $0.etaMinutes) },
+                           uniquingKeysWith: { min($0, $1) })
 
             var mergedById: [String: BusLive] = [:]
             try await withThrowingTaskGroup(of: [BusLive].self) { group in
@@ -2490,7 +2765,11 @@ final class MapVM: ObservableObject {
         guard !top.isEmpty else { return }
 
         let snap = makeRouteSnapshot()
-        let etaByRoute = Dictionary(uniqueKeysWithValues: top.map { ($0.routeNo, $0.etaMinutes) })
+        // 기존: let etaByRoute = Dictionary(uniqueKeysWithValues: top.map { ($0.routeNo, $0.etaMinutes) })
+
+        let etaByRoute: [String: Int] =
+            Dictionary(top.map { ($0.routeNo, $0.etaMinutes) },
+                       uniquingKeysWith: { min($0, $1) })
         var mergedById: [String: BusLive] = Dictionary(uniqueKeysWithValues: self.buses.map { ($0.id, $0) })
 
         do {
@@ -3546,13 +3825,28 @@ struct ClusteredMapView: UIViewRepresentable {
 
             // 2) 정류소 탭: 포커스 세팅 + ETA 로드
             if let stop = view.annotation as? BusStopAnnotation {
-                Task { [weak self] in
-                    guard let self else { return }
-                    await MainActor.run { self.parent.vm.setFocusStop(stop.stop) }   // 패널 표시 트리거
-                    await self.parent.vm.refreshFocusStopETA()                        // ETA 채우기
+                Task { [weak self, weak mapView] in
+                    guard let self, let mapView else { return }
+
+                    // 패널 포커스 + ETA
+                    await MainActor.run { self.parent.vm.setFocusStop(stop.stop) }
+                    await self.parent.vm.refreshFocusStopETA()
+
+                    // ✅ 같은 정류소를 다시 눌러도 didSelect가 또 호출되도록 즉시 해제
+                    DispatchQueue.main.async {
+                        mapView.deselectAnnotation(stop, animated: false)
+                    }
                 }
                 return
             }
+//            if let stop = view.annotation as? BusStopAnnotation {
+//                Task { [weak self] in
+//                    guard let self else { return }
+//                    await MainActor.run { self.parent.vm.setFocusStop(stop.stop) }   // 패널 표시 트리거
+//                    await self.parent.vm.refreshFocusStopETA()                        // ETA 채우기
+//                }
+//                return
+//            }
         }
 
 
@@ -3711,6 +4005,10 @@ final class LocationAuth: NSObject, ObservableObject, CLLocationManagerDelegate 
 
 // MARK: - Screen
 struct BusMapScreen: View {
+    // BusMapScreen
+    @State private var noticeText: String? = nil      // 서버 문자열(또는 "공지 없음")
+    @State private var hideNoticeThisSession = false  // 세션 전용 닫힘 상태
+
     @StateObject private var vm = MapVM()
     @StateObject private var loc = LocationAuth()
     @State private var recenterRequest = false
@@ -3845,6 +4143,11 @@ struct BusMapScreen: View {
                 .padding(.top, 8)
                 .padding(.leading, 8)
             }
+        // BusMapScreen.body 어딘가
+        .task { NoticeCenter.shared.startAutoRefresh() }
+        .onReceive(NotificationCenter.default.publisher(for: UIApplication.willEnterForegroundNotification)) { _ in
+            Task { await NoticeCenter.shared.fetchOnce() }
+        }
 
             // 최초 진입 시/재진입 시 개수 동기화
             .task {
@@ -3852,35 +4155,44 @@ struct BusMapScreen: View {
             }
 
             // 상단 배너
-            .safeAreaInset(edge: .top)  {
-                AdFitVerboseBannerView(
-                    clientId: "DAN-0pxnvDh8ytVm0EsZ",
-                    adUnitSize: "320x50",
-                    timeoutSec: 8,
-                    maxRetries: 2
-                ) { event in
-                    switch event {
-                    case .begin(let n):  debugText = "BEGIN \(n)"
-                    case .willLoad:      debugText = "WILL_LOAD"
-                    case .success(let ms):
-                        showBanner = true
-                        debugText = "SUCCESS \(ms)ms"
-                    case .fail(let err, let n):
-                        showBanner = false
-                        debugText = "FAIL(\(n)): \(err.localizedDescription)"
-                    case .timeout(let sec, let n):
-                        showBanner = false
-                        debugText = "TIMEOUT \(sec)s (attempt \(n))"
-                    case .retryScheduled(let after, let next):
-                        debugText = "RETRY in \(after)s → \(next)"
-                    case .disposed:
-                        debugText = "disposed"
+            .safeAreaInset(edge: .top) {
+                VStack(spacing: 6) {
+                    // 1) 광고
+                    AdFitVerboseBannerView(
+                        clientId: "DAN-0pxnvDh8ytVm0EsZ",
+                        adUnitSize: "320x50",
+                        timeoutSec: 8,
+                        maxRetries: 2
+                    ) { event in
+                        switch event {
+                        case .begin(let n):  debugText = "BEGIN \(n)"
+                        case .willLoad:      debugText = "WILL_LOAD"
+                        case .success(let ms):
+                            showBanner = true
+                            debugText = "SUCCESS \(ms)ms"
+                        case .fail(let err, let n):
+                            showBanner = false
+                            debugText = "FAIL(\(n)): \(err.localizedDescription)"
+                        case .timeout(let sec, let n):
+                            showBanner = false
+                            debugText = "TIMEOUT \(sec)s (attempt \(n))"
+                        case .retryScheduled(let after, let next):
+                            debugText = "RETRY in \(after)s → \(next)"
+                        case .disposed:
+                            debugText = "disposed"
+                        }
                     }
+                    .frame(width: 320, height: 50)
+                    .opacity(showBanner ? 1 : 0)
+                    .allowsHitTesting(showBanner)
+
+                    // 공지 바 (광고 바로 아래)
+                            NoticeBarView()
+                                .fixedSize(horizontal: false, vertical: true)   // 줄바꿈 시 높이만 늘어나게
+                                .padding(.horizontal, 8)
                 }
-                .frame(width: 320, height: 50)
-                .opacity(showBanner ? 1 : 0)
-                .allowsHitTesting(showBanner)
-                .padding(.bottom, 8)
+                .padding(.vertical, 8)                 // 위아래 살짝 여백
+                .frame(maxWidth: .infinity, alignment: .top)
                 .animation(.easeInOut(duration: 0.2), value: showBanner)
             }
 
