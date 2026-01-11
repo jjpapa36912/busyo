@@ -6,6 +6,10 @@
 //
 
 import Foundation
+import os.log
+
+// 로깅 카테고리 정의
+private let logger = Logger(subsystem: Bundle.main.bundleIdentifier ?? "busyo", category: "NoticeCenter")
 
 struct RemoteNotice: Codable, Equatable {
     struct Body: Codable, Equatable {
@@ -31,42 +35,80 @@ final class NoticeCenter: ObservableObject {
     private var timer: Task<Void, Never>?
 
     func startAutoRefresh() {
+        logger.info("🔄 NoticeCenter: startAutoRefresh 호출됨")
         timer?.cancel()
         timer = Task {
             var wait: Double = 0 // 즉시 1회
+            var fetchCount = 0
             while !Task.isCancelled {
-                if wait > 0 { try? await Task.sleep(nanoseconds: UInt64(wait * 1_000_000_000)) }
+                if wait > 0 {
+                    logger.debug("⏰ NoticeCenter: \(wait)초 대기 중...")
+                    try? await Task.sleep(nanoseconds: UInt64(wait * 1_000_000_000))
+                }
+                
+                fetchCount += 1
+                logger.info("📡 NoticeCenter: fetch 시작 (횟수: \(fetchCount))")
                 await fetchOnce()
+                
                 // 정상/304 → 10분, 에러 → 지수 백오프 상한 30분
                 wait = (lastFetchError == nil) ? 600 : min((wait == 0 ? 30 : wait * 2), 1800)
+                logger.debug("⏱️ NoticeCenter: 다음 fetch까지 \(wait)초 대기 설정 (에러: \(self.lastFetchError ?? "없음"))")
             }
+            logger.warning("⚠️ NoticeCenter: Task가 취소됨")
         }
     }
 
-    func stopAutoRefresh() { timer?.cancel(); timer = nil }
+    func stopAutoRefresh() {
+        logger.info("⏹️ NoticeCenter: stopAutoRefresh 호출됨")
+        timer?.cancel()
+        timer = nil
+    }
 
     /// 이번 앱 실행에서만 공지를 숨김 (앱 재시작 시 다시 보임)
     func dismissForThisSession() {
+        logger.info("👋 NoticeCenter: 공지를 이번 세션에서 숨김 처리")
         hideThisSession = true
     }
 
     func fetchOnce() async {
+        logger.info("🌐 NoticeCenter: fetchOnce 시작 - URL: \(self.endpoint.absoluteString)")
+        
         var req = URLRequest(url: endpoint)
         req.timeoutInterval = 8
         if let etag = UserDefaults.standard.string(forKey: etagKey) {
+            logger.debug("🏷️ NoticeCenter: 저장된 ETag 사용: \(etag)")
             req.setValue(etag, forHTTPHeaderField: "If-None-Match")
+        } else {
+            logger.debug("🏷️ NoticeCenter: 저장된 ETag 없음 (첫 요청)")
         }
 
         do {
+            logger.debug("📤 NoticeCenter: URLSession 요청 시작...")
             let (data, resp) = try await URLSession.shared.data(for: req)
-            guard let http = resp as? HTTPURLResponse else { return }
+            logger.info("📥 NoticeCenter: 응답 수신 완료 (데이터 크기: \(data.count) bytes)")
+            
+            // ⬇️ 원본 문자열 찍기
+               if let raw = String(data: data, encoding: .utf8) {
+                   logger.debug("🧾 NoticeCenter: raw response=\(raw)")
+               } else {
+                   logger.debug("🧾 NoticeCenter: raw response (non-UTF8, size=\(data.count))")
+               }
+            
+            guard let http = resp as? HTTPURLResponse else {
+                logger.error("❌ NoticeCenter: HTTPURLResponse로 캐스팅 실패")
+                return
+            }
+
+            logger.info("📊 NoticeCenter: HTTP 상태 코드: \(http.statusCode)")
 
             if http.statusCode == 304 {
                 // 변경 없음
+                logger.info("✅ NoticeCenter: 304 Not Modified - 공지 변경 없음")
                 self.lastFetchError = nil
                 return
             }
             guard http.statusCode == 200 else {
+                logger.error("❌ NoticeCenter: HTTP 에러 - 상태 코드: \(http.statusCode)")
                 self.lastFetchError = "HTTP \(http.statusCode)"
                 // 실패 시에도 플레이스홀더로 표시
                 self.notice = RemoteNotice.Body(message: "공지 없음", level: "info", link: nil, startAt: nil, endAt: nil)
@@ -74,18 +116,40 @@ final class NoticeCenter: ObservableObject {
             }
 
             if let et = http.value(forHTTPHeaderField: "ETag") {
+                logger.debug("🏷️ NoticeCenter: 새 ETag 저장: \(et)")
                 UserDefaults.standard.set(et, forKey: etagKey)
             }
 
+            logger.debug("🔍 NoticeCenter: JSON 디코딩 시작...")
             let decoded = try JSONDecoder().decode(RemoteNotice.self, from: data)
+            logger.info("✅ NoticeCenter: JSON 디코딩 성공")
+            
             // 기간 필터
-            self.notice = Self.validated(decoded.notice)
+            let validated = Self.validated(decoded.notice)
+            self.notice = validated
             self.lastFetchError = nil
+            
+            if let v = validated {
+                logger.info("📢 NoticeCenter: 유효한 공지 설정됨 - 레벨: \(v.level), 메시지 길이: \(v.message.count)")
+            } else {
+                logger.info("⏰ NoticeCenter: 공지가 기간 필터링으로 제외됨")
+            }
 
             // 새로운 공지가 들어오면 이번 세션 숨김 해제(다시 보여주기)
             self.hideThisSession = false
+            logger.debug("👁️ NoticeCenter: hideThisSession = false (새 공지로 인한 재표시)")
 
+        } catch let error as URLError {
+            logger.error("❌ NoticeCenter: URLError 발생 - 코드: \(error.code.rawValue), 설명: \(error.localizedDescription)")
+            self.lastFetchError = error.localizedDescription
+            // 네트워크 실패 → '공지 없음' 플레이스홀더
+            self.notice = RemoteNotice.Body(message: "공지 없음", level: "info", link: nil, startAt: nil, endAt: nil)
+        } catch let error as DecodingError {
+            logger.error("❌ NoticeCenter: JSON 디코딩 에러 - \(error.localizedDescription)")
+            self.lastFetchError = "디코딩 실패: \(error.localizedDescription)"
+            self.notice = RemoteNotice.Body(message: "공지 없음", level: "info", link: nil, startAt: nil, endAt: nil)
         } catch {
+            logger.error("❌ NoticeCenter: 알 수 없는 에러 - \(error.localizedDescription)")
             self.lastFetchError = error.localizedDescription
             // 네트워크 실패 → '공지 없음' 플레이스홀더
             self.notice = RemoteNotice.Body(message: "공지 없음", level: "info", link: nil, startAt: nil, endAt: nil)
@@ -93,11 +157,23 @@ final class NoticeCenter: ObservableObject {
     }
 
     private static func validated(_ n: RemoteNotice.Body?) -> RemoteNotice.Body? {
-        guard let n else { return nil }
+        guard let n else {
+            logger.debug("⚪ NoticeCenter: validated - notice가 nil")
+            return nil
+        }
         let iso = ISO8601DateFormatter()
         let now = Date()
-        if let s = n.startAt, let d = iso.date(from: s), now < d { return nil }
-        if let e = n.endAt,   let d = iso.date(from: e), now > d { return nil }
+        
+        if let s = n.startAt, let d = iso.date(from: s), now < d {
+            logger.info("⏰ NoticeCenter: validated - 아직 시작 전 (startAt: \(s), 현재: \(now))")
+            return nil
+        }
+        if let e = n.endAt, let d = iso.date(from: e), now > d {
+            logger.info("⏰ NoticeCenter: validated - 이미 종료됨 (endAt: \(e), 현재: \(now))")
+            return nil
+        }
+        
+        logger.debug("✅ NoticeCenter: validated - 공지 유효함")
         return n
     }
 }
